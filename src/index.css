@@ -1,0 +1,42 @@
+@import "tailwindcss";
+
+* {
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
+  user-select: none;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  overflow-x: hidden;
+  background: #1a1a2e;
+}
+
+@keyframes pulse-glow {
+  0%, 100% { box-shadow: 0 0 4px 2px rgba(255, 255, 255, 0.4); }
+  50% { box-shadow: 0 0 12px 6px rgba(255, 255, 255, 0.8); }
+}
+
+.animate-pulse-glow {
+  animation: pulse-glow 1s ease-in-out infinite;
+}
+
+@keyframes dice-shake {
+  0%, 100% { transform: rotate(0deg); }
+  25% { transform: rotate(-10deg); }
+  75% { transform: rotate(10deg); }
+}
+
+.dice-shake {
+  animation: dice-shake 0.15s ease-in-out infinite;
+}
+
+@keyframes token-bounce {
+  0%, 100% { transform: translate(-50%, -50%) scale(1); }
+  50% { transform: translate(-50%, -50%) scale(1.2); }
+}
+
+.token-bounce {
+  animation: token-bounce 0.5s ease-in-out infinite;
+}
