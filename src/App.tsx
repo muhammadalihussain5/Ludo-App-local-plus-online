@@ -205,7 +205,7 @@ function OptionsScreen({ onStart, onBack }: { onStart: (o: GameOptions, pc: numb
 // ─── Online Login Screen ─────────────────────────────────────────────────────
 
 function OnlineLoginScreen({ onConnect }: { onConnect: (socket: Socket, username: string) => void }) {
-  const [serverUrl, setServerUrl] = useState(() => import.meta.env.VITE_SERVER_URL || 'http://localhost:3001');
+  const [serverUrl, setServerUrl] = useState(() => import.meta.env.VITE_SERVER_URL || 'https://ludo-app-local-plus-online.onrender.com/');
   const [username, setUsername] = useState('');
   const [error, setError] = useState('');
   const [connecting, setConnecting] = useState(false);
