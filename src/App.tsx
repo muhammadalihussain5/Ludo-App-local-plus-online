@@ -205,7 +205,7 @@ function OptionsScreen({ onStart, onBack }: { onStart: (o: GameOptions, pc: numb
 // ─── Online Login Screen ─────────────────────────────────────────────────────
 
 function OnlineLoginScreen({ onConnect }: { onConnect: (socket: Socket, username: string) => void }) {
-  const [serverUrl, setServerUrl] = useState('http://localhost:3001');
+  const [serverUrl, setServerUrl] = useState(() => import.meta.env.VITE_SERVER_URL || 'http://localhost:3001');
   const [username, setUsername] = useState('');
   const [error, setError] = useState('');
   const [connecting, setConnecting] = useState(false);
@@ -272,7 +272,8 @@ function OnlineLoginScreen({ onConnect }: { onConnect: (socket: Socket, username
           </button>
         </div>
         <div className="mt-4 text-center">
-          <p className="text-white/30 text-xs">Start the server first: <code className="bg-white/10 px-1.5 py-0.5 rounded">cd server && npm start</code></p>
+          <p className="text-white/30 text-xs">For production, enter your Render backend URL, for example: https://your-app.onrender.com</p>
+          <p className="text-white/30 text-xs mt-1">Local dev: <code className="bg-white/10 px-1.5 py-0.5 rounded">cd server && npm start</code></p>
         </div>
       </div>
     </div>

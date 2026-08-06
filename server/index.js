@@ -7,7 +7,9 @@ const fs = require('fs');
 const { execSync } = require('child_process');
 
 const app = express();
-app.use(cors());
+const allowedOrigins = (process.env.CORS_ORIGINS || 'http://localhost:5173,http://localhost:3000').split(',').map(origin => origin.trim()).filter(Boolean);
+app.use(cors({ origin: allowedOrigins, credentials: true }));
+app.get('/health', (req, res) => res.json({ ok: true }));
 
 // Serve client build from ../dist. If missing, attempt to build the client automatically.
 const CLIENT_DIST = path.join(__dirname, '..', 'dist');
@@ -26,7 +28,7 @@ try {
   console.error('Error while preparing client build:', err);
 }
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*' } });
+const io = new Server(server, { cors: { origin: allowedOrigins, methods: ['GET', 'POST'], credentials: true } });
 
 // ─── Game Constants ──────────────────────────────────────────────────────────
 
