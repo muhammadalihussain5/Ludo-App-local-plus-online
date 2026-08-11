@@ -17,6 +17,7 @@ export interface Token {
 export interface GameState {
   players: PlayerColor[];
   currentPlayerIndex: number;
+  gameId: string;
   tokens: Token[];
   diceValues: number[];
   pendingDice: number[];
@@ -34,6 +35,7 @@ export interface GameState {
   consecutiveSixes: number;       // 1-die: counts consecutive 6s; 2-dice: counts consecutive double-6s
   // Whether the current roll had a 6 (for "choose" mode override)
   rollHasSix: boolean;
+  captureCounts: Record<PlayerColor, number>;
 }
 
 export const PLAYER_COLORS: Record<PlayerColor, { bg: string; light: string; dark: string; text: string; border: string }> = {
@@ -87,6 +89,10 @@ export const HOME_BASE_INNER: Record<PlayerColor, { r1: number; r2: number; c1: 
   red: { r1: 10, r2: 13, c1: 1, c2: 4 },
   blue: { r1: 10, r2: 13, c1: 10, c2: 13 },
 };
+
+export function createEmptyCaptureCounts(): Record<PlayerColor, number> {
+  return { green: 0, yellow: 0, red: 0, blue: 0 };
+}
 
 const pathLookup = new Map<string, number>();
 MAIN_PATH.forEach(([r, c], idx) => { pathLookup.set(`${r},${c}`, idx); });
@@ -151,19 +157,30 @@ export function isSafePosition(pathIndex: number): boolean {
   return SAFE_POSITIONS.includes(pathIndex);
 }
 
-export function getValidMoves(tokens: Token[], player: PlayerColor, diceValue: number): Token[] {
+export function getValidMoves(
+  tokens: Token[],
+  player: PlayerColor,
+  diceValue: number,
+  captureCounts: Record<PlayerColor, number> = createEmptyCaptureCounts(),
+): Token[] {
   return tokens.filter(t => t.player === player).filter(token => {
     if (token.steps === -1) return diceValue === 6;
     if (token.steps >= 56) return false;
+    if (token.steps < 51 && token.steps + diceValue > 50 && captureCounts[player] <= 0) return false;
     return token.steps + diceValue <= 56;
   });
 }
 
-export function getValidMovesForAnyDice(tokens: Token[], player: PlayerColor, pendingDice: number[]): Token[] {
+export function getValidMovesForAnyDice(
+  tokens: Token[],
+  player: PlayerColor,
+  pendingDice: number[],
+  captureCounts: Record<PlayerColor, number> = createEmptyCaptureCounts(),
+): Token[] {
   const seen = new Set<string>();
   const result: Token[] = [];
   for (const dv of pendingDice) {
-    for (const t of getValidMoves(tokens, player, dv)) {
+    for (const t of getValidMoves(tokens, player, dv, captureCounts)) {
       const key = `${t.player}-${t.id}`;
       if (!seen.has(key)) { seen.add(key); result.push(t); }
     }
@@ -171,12 +188,14 @@ export function getValidMovesForAnyDice(tokens: Token[], player: PlayerColor, pe
   return result;
 }
 
-export function executeMove(tokens: Token[], token: Token, diceValue: number): {
+export function executeMove(tokens: Token[], token: Token, diceValue: number, captureCounts: Record<PlayerColor, number>): {
   tokens: Token[];
   captured: boolean;
   enteredBoard: boolean;
+  captureCounts: Record<PlayerColor, number>;
 } {
   const newTokens = tokens.map(t => ({ ...t }));
+  const newCaptureCounts = { ...captureCounts };
   const movingToken = newTokens.find(t => t.id === token.id && t.player === token.player)!;
   let captured = false;
   let enteredBoard = false;
@@ -194,13 +213,17 @@ export function executeMove(tokens: Token[], token: Token, diceValue: number): {
       newTokens.forEach(t => {
         if (t.player !== movingToken.player && t.steps >= 0 && t.steps <= 50) {
           const tPathIndex = (START_INDICES[t.player] + t.steps) % 52;
-          if (tPathIndex === pathIndex) { t.steps = -1; captured = true; }
+          if (tPathIndex === pathIndex) {
+            t.steps = -1;
+            captured = true;
+            newCaptureCounts[movingToken.player] += 1;
+          }
         }
       });
     }
   }
 
-  return { tokens: newTokens, captured, enteredBoard };
+  return { tokens: newTokens, captured, enteredBoard, captureCounts: newCaptureCounts };
 }
 
 export function checkWin(tokens: Token[], player: PlayerColor): boolean {
@@ -241,8 +264,13 @@ export function isDoubleSix(diceValues: number[]): boolean {
 }
 
 // AI logic
-export function getAIMove(tokens: Token[], player: PlayerColor, diceValue: number): Token | null {
-  const validMoves = getValidMoves(tokens, player, diceValue);
+export function getAIMove(
+  tokens: Token[],
+  player: PlayerColor,
+  diceValue: number,
+  captureCounts: Record<PlayerColor, number> = createEmptyCaptureCounts(),
+): Token | null {
+  const validMoves = getValidMoves(tokens, player, diceValue, captureCounts);
   if (validMoves.length === 0) return null;
 
   // Priority 1: Capture
@@ -286,12 +314,13 @@ export function getAIMoveTwoDice(
   tokens: Token[],
   player: PlayerColor,
   pendingDice: number[],
+  captureCounts: Record<PlayerColor, number> = createEmptyCaptureCounts(),
 ): { diceIndex: number; token: Token } | null {
   let bestMove: { diceIndex: number; token: Token; priority: number } | null = null;
 
   for (let i = 0; i < pendingDice.length; i++) {
     const dv = pendingDice[i];
-    const move = getAIMove(tokens, player, dv);
+    const move = getAIMove(tokens, player, dv, captureCounts);
     if (!move) continue;
 
     let priority = 0;
@@ -324,6 +353,7 @@ export function getAIMoveTwoDice(
 }
 
 export function createInitialState(players: PlayerColor[], options: GameOptions): GameState {
+  const gameId = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   const tokens: Token[] = [];
   players.forEach(player => {
     for (let i = 0; i < 4; i++) tokens.push({ id: i, player, steps: -1 });
@@ -331,6 +361,7 @@ export function createInitialState(players: PlayerColor[], options: GameOptions)
   return {
     players,
     currentPlayerIndex: 0,
+    gameId,
     tokens,
     diceValues: [],
     pendingDice: [],
@@ -345,6 +376,7 @@ export function createInitialState(players: PlayerColor[], options: GameOptions)
     turnSnapshot: tokens.map(t => ({ ...t })),
     consecutiveSixes: 0,
     rollHasSix: false,
+    captureCounts: createEmptyCaptureCounts(),
   };
 }
 

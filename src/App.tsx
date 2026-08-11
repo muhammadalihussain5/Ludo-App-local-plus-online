@@ -4,7 +4,7 @@ import {
   type PlayerColor, type GameState, type Token, type GameOptions,
   PLAYER_COLORS, START_INDICES, getCellInfo, getTokenPosition,
   getValidMoves, getValidMovesForAnyDice, executeMove, checkWin,
-  createInitialState, getCurrentPlayer, isHumanTurn, capitalize,
+  createInitialState, createEmptyCaptureCounts, getCurrentPlayer, isHumanTurn, capitalize,
   shouldReverseTurn, shouldGetExtraTurnFromDice, rollHasSix, isDoubleSix,
   getAIMove, getAIMoveTwoDice,
 } from './gameLogic';
@@ -18,13 +18,118 @@ const DEFAULT_OPTIONS: GameOptions = {
 
 type Screen = 'start' | 'options' | 'online-login' | 'online-lobby' | 'game';
 
+type SavedGameMode = 'local' | 'online';
+
+interface SavedGameSummary {
+  gameId: string;
+  mode: SavedGameMode;
+  updatedAt: number;
+  title: string;
+  gameState: GameState;
+  roomId?: string;
+}
+
 interface RoomInfo {
   id: string; host: string; players: string[];
   playerColors: Record<string, PlayerColor>; options: GameOptions;
   started: boolean; playerCount: number;
+  paused?: boolean;
+  gameId?: string;
+  vacantSlots?: { username: string; color: PlayerColor }[];
 }
 
 interface InviteInfo { roomId: string; from: string; playerCount: number; }
+
+interface AdminAccountRecord {
+  username: string;
+  createdAt: number;
+  lastLogin: number;
+}
+
+interface AdminGameRecord {
+  gameId: string;
+  roomId: string;
+  host: string;
+  participants: string[];
+  paused: boolean;
+  completed: boolean;
+  updatedAt: number;
+  title: string;
+}
+
+interface AdminDataPayload {
+  accounts: AdminAccountRecord[];
+  savedGames: AdminGameRecord[];
+}
+
+const LOCAL_SAVE_KEY = 'traditional-ludo.saved-local-games';
+const ADMIN_SHORTCUT = 'Ctrl+Shift+Alt+A';
+
+function getDefaultServerUrl() {
+  if (typeof window === 'undefined') return 'https://ludo-app-local-plus-online.onrender.com/';
+  if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
+    return 'http://localhost:3001';
+  }
+  return 'https://ludo-app-local-plus-online.onrender.com/';
+}
+
+function createBlankCaptureCounts(): Record<PlayerColor, number> {
+  return createEmptyCaptureCounts();
+}
+
+function normalizeGameState(state: GameState): GameState {
+  return {
+    ...state,
+    gameId: state.gameId || (globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`),
+    captureCounts: state.captureCounts || createBlankCaptureCounts(),
+  };
+}
+
+function buildSavedGameTitle(state: GameState): string {
+  const current = state.players[state.currentPlayerIndex];
+  return `${capitalize(current)} to move`;
+}
+
+function loadLocalSavedGames(): SavedGameSummary[] {
+  if (typeof window === 'undefined') return [];
+  try {
+    const raw = window.localStorage.getItem(LOCAL_SAVE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as SavedGameSummary[];
+    return Array.isArray(parsed) ? parsed.map(item => ({ ...item, gameState: normalizeGameState(item.gameState) })) : [];
+  } catch {
+    return [];
+  }
+}
+
+function isEditableTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  const tagName = target.tagName;
+  return target.isContentEditable || tagName === 'INPUT' || tagName === 'TEXTAREA' || tagName === 'SELECT';
+}
+
+function saveLocalGameSnapshot(gameState: GameState) {
+  if (typeof window === 'undefined') return;
+  const current = loadLocalSavedGames().filter(game => game.gameId !== gameState.gameId);
+  if (gameState.winner) {
+    window.localStorage.setItem(LOCAL_SAVE_KEY, JSON.stringify(current));
+    return;
+  }
+  current.unshift({
+    gameId: gameState.gameId,
+    mode: 'local',
+    updatedAt: Date.now(),
+    title: buildSavedGameTitle(gameState),
+    gameState: normalizeGameState(gameState),
+  });
+  window.localStorage.setItem(LOCAL_SAVE_KEY, JSON.stringify(current.slice(0, 8)));
+}
+
+function removeLocalGameSnapshot(gameId: string) {
+  if (typeof window === 'undefined') return;
+  const current = loadLocalSavedGames().filter(game => game.gameId !== gameId);
+  window.localStorage.setItem(LOCAL_SAVE_KEY, JSON.stringify(current));
+}
 
 // ─── Toggle Switch ───────────────────────────────────────────────────────────
 
@@ -121,7 +226,9 @@ function BoardCell({ r, c, cellSize, tokensOnCell, validTokenIds, onTokenClick }
 
 // ─── Start Screen ────────────────────────────────────────────────────────────
 
-function StartScreen({ onLocal, onOnline }: { onLocal: () => void; onOnline: () => void }) {
+function StartScreen({ onLocal, onOnline, savedGames, onResumeLocal }: {
+  onLocal: () => void; onOnline: () => void; savedGames: SavedGameSummary[]; onResumeLocal: (gameId: string) => void;
+}) {
   return (
     <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-br from-indigo-900 via-purple-900 to-pink-900 p-4">
       <div className="text-center mb-8">
@@ -140,6 +247,22 @@ function StartScreen({ onLocal, onOnline }: { onLocal: () => void; onOnline: () 
             <div className="text-sm opacity-80 mt-1">Play with friends online</div>
           </button>
         </div>
+        {savedGames.length > 0 && (
+          <div className="mt-5 bg-black/20 rounded-2xl p-4 border border-white/10">
+            <h3 className="text-white text-sm font-semibold mb-3">Resume Local Game</h3>
+            <div className="space-y-2 max-h-40 overflow-y-auto pr-1">
+              {savedGames.map(game => (
+                <button key={game.gameId} onClick={() => onResumeLocal(game.gameId)} className="w-full text-left px-3 py-2 rounded-xl bg-white/10 hover:bg-white/20 transition-colors">
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-white text-sm font-medium">{game.title}</span>
+                    <span className="text-white/40 text-xs">{new Date(game.updatedAt).toLocaleString()}</span>
+                  </div>
+                  <div className="text-white/40 text-xs mt-1">Game ID: {game.gameId}</div>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
       <div className="mt-8 flex gap-3">
         {(['green','yellow','red','blue'] as PlayerColor[]).map(c => (
@@ -207,21 +330,26 @@ function OptionsScreen({ onStart, onBack }: { onStart: (o: GameOptions, pc: numb
 function OnlineLoginScreen({ onConnect }: { onConnect: (socket: Socket, username: string) => void }) {
   const [serverUrl, setServerUrl] = useState(() => import.meta.env.VITE_SERVER_URL || 'https://ludo-app-local-plus-online.onrender.com/');
   const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [mode, setMode] = useState<'login' | 'create'>('login');
   const [error, setError] = useState('');
   const [connecting, setConnecting] = useState(false);
 
   const handleConnect = () => {
     if (!username.trim() || username.trim().length < 2) { setError('Username must be at least 2 characters'); return; }
+    if (mode === 'create' && password.length < 4) { setError('Password must be at least 4 characters'); return; }
+    if (mode === 'create' && password !== confirmPassword) { setError('Passwords do not match'); return; }
     setConnecting(true); setError('');
     const socket = io(serverUrl, { transports: ['websocket', 'polling'] });
 
     socket.on('connect', () => {
-      socket.emit('login', username.trim());
+      socket.emit(mode === 'create' ? 'create-account' : 'login', { username: username.trim(), password });
     });
 
-    socket.on('login-success', (data: { username: string }) => {
+    socket.on('login-success', (data: { username: string; savedGames: SavedGameSummary[] }) => {
       setConnecting(false);
-      onConnect(socket, data.username);
+      onConnect(socket, data.username, data.savedGames || []);
     });
 
     socket.on('login-error', (data: { message: string }) => {
@@ -253,6 +381,10 @@ function OnlineLoginScreen({ onConnect }: { onConnect: (socket: Socket, username
       </div>
       <div className="bg-white/10 backdrop-blur-lg rounded-3xl p-6 shadow-2xl border border-white/20 max-w-sm w-full">
         <div className="space-y-4">
+          <div className="grid grid-cols-2 gap-2 p-1 bg-white/10 rounded-xl">
+            <button onClick={() => setMode('login')} className={`py-2 rounded-lg text-sm font-medium ${mode === 'login' ? 'bg-blue-500 text-white' : 'text-white/60'}`}>Login</button>
+            <button onClick={() => setMode('create')} className={`py-2 rounded-lg text-sm font-medium ${mode === 'create' ? 'bg-green-500 text-white' : 'text-white/60'}`}>Create Account</button>
+          </div>
           <div>
             <label className="text-white/70 text-sm mb-1 block">Server URL</label>
             <input type="text" value={serverUrl} onChange={e => setServerUrl(e.target.value)}
@@ -265,10 +397,24 @@ function OnlineLoginScreen({ onConnect }: { onConnect: (socket: Socket, username
               className="w-full px-4 py-3 rounded-xl bg-white/10 border border-white/20 text-white placeholder-white/30 focus:outline-none focus:border-blue-400"
               placeholder="Enter your name" />
           </div>
+          <div>
+            <label className="text-white/70 text-sm mb-1 block">Password</label>
+            <input type="password" value={password} onChange={e => setPassword(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleConnect()}
+              className="w-full px-4 py-3 rounded-xl bg-white/10 border border-white/20 text-white placeholder-white/30 focus:outline-none focus:border-blue-400"
+              placeholder="Enter password" />
+          </div>
+          {mode === 'create' && (
+            <div>
+              <label className="text-white/70 text-sm mb-1 block">Confirm Password</label>
+              <input type="password" value={confirmPassword} onChange={e => setConfirmPassword(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleConnect()}
+                className="w-full px-4 py-3 rounded-xl bg-white/10 border border-white/20 text-white placeholder-white/30 focus:outline-none focus:border-blue-400"
+                placeholder="Confirm password" />
+            </div>
+          )}
           {error && <p className="text-red-400 text-sm text-center">{error}</p>}
           <button onClick={handleConnect} disabled={connecting}
             className="w-full py-3 rounded-xl bg-gradient-to-r from-blue-500 to-indigo-600 text-white font-bold shadow-lg hover:scale-105 transition-transform active:scale-95 disabled:opacity-50">
-            {connecting ? 'Connecting...' : 'Connect & Login'}
+            {connecting ? 'Connecting...' : mode === 'create' ? 'Create Account & Join' : 'Connect & Login'}
           </button>
         </div>
         <div className="mt-4 text-center">
@@ -282,9 +428,9 @@ function OnlineLoginScreen({ onConnect }: { onConnect: (socket: Socket, username
 
 // ─── Online Lobby Screen ─────────────────────────────────────────────────────
 
-function OnlineLobbyScreen({ socket, username, onlineUsers, roomInfo, invites, onBack }: {
+function OnlineLobbyScreen({ socket, username, onlineUsers, roomInfo, invites, savedGames, onBack, onResumeGame }: {
   socket: Socket; username: string; onlineUsers: string[]; roomInfo: RoomInfo | null;
-  invites: InviteInfo[]; onBack: () => void;
+  invites: InviteInfo[]; savedGames: SavedGameSummary[]; onBack: () => void; onResumeGame: (gameId: string) => void;
 }) {
   const [playerCount, setPlayerCount] = useState(4);
   const [options, setOptions] = useState<GameOptions>({ ...DEFAULT_OPTIONS, isAIMode: false });
@@ -398,9 +544,39 @@ function OnlineLobbyScreen({ socket, username, onlineUsers, roomInfo, invites, o
                 <label className="flex items-center gap-1 text-white/60"><input type="checkbox" checked={options.extraRollOnEntry} onChange={e => setOptions(o => ({...o, extraRollOnEntry: e.target.checked}))} /> Entry bonus</label>
                 <label className="flex items-center gap-1 text-white/60"><input type="checkbox" checked={options.extraTurnOnCapture} onChange={e => setOptions(o => ({...o, extraTurnOnCapture: e.target.checked}))} /> Capture bonus</label>
               </div>
+              <div>
+                <p className="text-white/60 text-xs mb-1">Dice</p>
+                <div className="grid grid-cols-2 gap-2">
+                  <button onClick={() => setOptions(o => ({ ...o, diceCount: 1 }))} className={`py-2 rounded-lg text-sm font-medium ${options.diceCount === 1 ? 'bg-amber-500 text-white' : 'bg-white/10 text-white/60'}`}>1 Die</button>
+                  <button onClick={() => setOptions(o => ({ ...o, diceCount: 2 }))} className={`py-2 rounded-lg text-sm font-medium ${options.diceCount === 2 ? 'bg-amber-500 text-white' : 'bg-white/10 text-white/60'}`}>2 Dice</button>
+                </div>
+                {options.diceCount === 2 && (
+                  <div className="grid grid-cols-2 gap-2 mt-2">
+                    <button onClick={() => setOptions(o => ({ ...o, twoDiceMode: 'both' }))} className={`py-2 rounded-lg text-xs font-medium ${options.twoDiceMode === 'both' ? 'bg-amber-500 text-white' : 'bg-white/10 text-white/60'}`}>Use Both</button>
+                    <button onClick={() => setOptions(o => ({ ...o, twoDiceMode: 'choose' }))} className={`py-2 rounded-lg text-xs font-medium ${options.twoDiceMode === 'choose' ? 'bg-amber-500 text-white' : 'bg-white/10 text-white/60'}`}>Choose One</button>
+                  </div>
+                )}
+              </div>
               <button onClick={createRoom} className="w-full py-3 bg-gradient-to-r from-blue-500 to-indigo-600 text-white font-bold rounded-xl shadow-lg hover:scale-105 transition-transform active:scale-95">
                 Create Room
               </button>
+            </div>
+          </div>
+        )}
+
+        {savedGames.length > 0 && (
+          <div className="bg-white/5 border border-white/20 rounded-2xl p-4 mb-4">
+            <h3 className="text-white font-semibold text-sm mb-3">🔁 Resume Saved Games</h3>
+            <div className="space-y-2 max-h-52 overflow-y-auto pr-1">
+              {savedGames.map(game => (
+                <button key={game.gameId} onClick={() => onResumeGame(game.gameId)} className="w-full text-left px-3 py-2 rounded-xl bg-white/10 hover:bg-white/20 transition-colors">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-white text-sm font-medium">{game.title}</span>
+                    <span className="text-white/40 text-xs">{new Date(game.updatedAt).toLocaleDateString()}</span>
+                  </div>
+                  <div className="text-white/40 text-xs mt-1">Game ID: {game.gameId}</div>
+                </button>
+              ))}
             </div>
           </div>
         )}
@@ -431,6 +607,217 @@ function OnlineLobbyScreen({ socket, username, onlineUsers, roomInfo, invites, o
   );
 }
 
+// ─── Admin Portal ──────────────────────────────────────────────────────────
+
+function AdminPortal({
+  open,
+  onClose,
+  onRefreshLocal,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onRefreshLocal: () => void;
+}) {
+  const [serverUrl, setServerUrl] = useState(() => getDefaultServerUrl());
+  const [adminKey, setAdminKey] = useState('');
+  const [connecting, setConnecting] = useState(false);
+  const [socket, setSocket] = useState<Socket | null>(null);
+  const [adminData, setAdminData] = useState<AdminDataPayload>({ accounts: [], savedGames: [] });
+  const [status, setStatus] = useState('');
+  const [localSavedGames, setLocalSavedGames] = useState<SavedGameSummary[]>([]);
+
+  useEffect(() => {
+    if (!open) return;
+    setLocalSavedGames(loadLocalSavedGames());
+  }, [open]);
+
+  useEffect(() => {
+    if (!socket) return;
+
+    const onAdminData = (data: AdminDataPayload) => setAdminData(data);
+    const onAdminAuthError = (data: { message: string }) => {
+      setConnecting(false);
+      setStatus(data.message);
+      socket.disconnect();
+      setSocket(null);
+    };
+    const onAdminAuthSuccess = () => {
+      setConnecting(false);
+      setStatus('Admin access granted');
+    };
+
+    socket.on('admin-data', onAdminData);
+    socket.on('admin-auth-error', onAdminAuthError);
+    socket.on('admin-auth-success', onAdminAuthSuccess);
+
+    return () => {
+      socket.off('admin-data', onAdminData);
+      socket.off('admin-auth-error', onAdminAuthError);
+      socket.off('admin-auth-success', onAdminAuthSuccess);
+    };
+  }, [socket]);
+
+  useEffect(() => {
+    if (!open && socket) {
+      socket.disconnect();
+      setSocket(null);
+    }
+  }, [open, socket]);
+
+  const connectAdmin = () => {
+    if (!adminKey.trim()) {
+      setStatus('Admin key required');
+      return;
+    }
+    setConnecting(true);
+    setStatus('Connecting...');
+    const adminSocket = io(serverUrl, { transports: ['websocket', 'polling'] });
+
+    adminSocket.on('connect', () => {
+      adminSocket.emit('admin-auth', { secret: adminKey.trim() });
+    });
+
+    adminSocket.on('connect_error', () => {
+      setConnecting(false);
+      setStatus('Could not connect to server');
+      adminSocket.disconnect();
+    });
+
+    setSocket(adminSocket);
+  };
+
+  const refresh = () => {
+    socket?.emit('admin-refresh');
+    setLocalSavedGames(loadLocalSavedGames());
+    onRefreshLocal();
+  };
+
+  const deleteAccount = (username: string) => {
+    socket?.emit('admin-delete-account', { username });
+  };
+
+  const deleteServerGame = (gameId: string) => {
+    socket?.emit('admin-delete-saved-game', { gameId });
+  };
+
+  const deleteLocalGame = (gameId: string) => {
+    removeLocalGameSnapshot(gameId);
+    setLocalSavedGames(loadLocalSavedGames());
+    onRefreshLocal();
+  };
+
+  return (
+    <div className={`fixed inset-0 z-[100] ${open ? 'flex' : 'hidden'} items-center justify-center bg-black/80 p-4`}>
+      <div className="w-full max-w-5xl max-h-[92vh] overflow-hidden rounded-3xl border border-white/20 bg-slate-950 text-white shadow-2xl">
+        <div className="flex items-center justify-between border-b border-white/10 px-5 py-4">
+          <div>
+            <h2 className="text-xl font-bold">Admin Portal</h2>
+            <p className="text-xs text-white/40">Hidden access panel</p>
+          </div>
+          <div className="flex items-center gap-2">
+            <button onClick={refresh} className="rounded-xl bg-white/10 px-3 py-2 text-sm text-white/80 hover:bg-white/20">Refresh</button>
+            <button onClick={onClose} className="rounded-xl bg-red-500/80 px-3 py-2 text-sm font-semibold text-white hover:bg-red-500">Close</button>
+          </div>
+        </div>
+
+        <div className="grid gap-4 p-5 md:grid-cols-[320px_1fr]">
+          <div className="space-y-4">
+            <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+              <h3 className="mb-3 text-sm font-semibold text-white">Admin Access</h3>
+              <div className="space-y-3">
+                <div>
+                  <label className="mb-1 block text-xs text-white/50">Server URL</label>
+                  <input value={serverUrl} onChange={e => setServerUrl(e.target.value)} className="w-full rounded-xl border border-white/10 bg-white/10 px-3 py-2 text-sm text-white outline-none" />
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs text-white/50">Admin Key</label>
+                  <input type="password" value={adminKey} onChange={e => setAdminKey(e.target.value)} className="w-full rounded-xl border border-white/10 bg-white/10 px-3 py-2 text-sm text-white outline-none" />
+                </div>
+                <button onClick={connectAdmin} disabled={connecting} className="w-full rounded-xl bg-indigo-500 px-3 py-2 text-sm font-semibold text-white disabled:opacity-50">
+                  {connecting ? 'Connecting...' : 'Unlock Admin'}
+                </button>
+                <p className="text-xs text-amber-300/80">Shortcut: {ADMIN_SHORTCUT}</p>
+                {status && <p className="text-xs text-white/60">{status}</p>}
+              </div>
+            </div>
+
+            <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+              <div className="mb-3 flex items-center justify-between">
+                <h3 className="text-sm font-semibold text-white">Local Saved Games</h3>
+                <span className="text-xs text-white/40">{localSavedGames.length}</span>
+              </div>
+              <div className="max-h-56 space-y-2 overflow-y-auto pr-1">
+                {localSavedGames.length === 0 ? (
+                  <p className="text-sm text-white/40">No local saves</p>
+                ) : localSavedGames.map(game => (
+                  <div key={game.gameId} className="rounded-xl border border-white/10 bg-black/20 p-3">
+                    <div className="flex items-start justify-between gap-2">
+                      <div>
+                        <p className="text-sm font-medium">{game.title}</p>
+                        <p className="text-[11px] text-white/40">{game.gameId}</p>
+                      </div>
+                      <button onClick={() => deleteLocalGame(game.gameId)} className="rounded-lg bg-red-500/70 px-2 py-1 text-[11px] font-semibold">Delete</button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          <div className="grid gap-4 lg:grid-cols-2">
+            <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+              <div className="mb-3 flex items-center justify-between">
+                <h3 className="text-sm font-semibold text-white">Accounts</h3>
+                <span className="text-xs text-white/40">{adminData.accounts.length}</span>
+              </div>
+              <div className="max-h-[34rem] space-y-2 overflow-y-auto pr-1">
+                {adminData.accounts.length === 0 ? (
+                  <p className="text-sm text-white/40">Unlock admin to view accounts.</p>
+                ) : adminData.accounts.map(account => (
+                  <div key={account.username} className="rounded-xl border border-white/10 bg-black/20 p-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <p className="text-sm font-medium">{account.username}</p>
+                        <p className="text-[11px] text-white/40">Created: {new Date(account.createdAt).toLocaleString()}</p>
+                        <p className="text-[11px] text-white/40">Last login: {new Date(account.lastLogin).toLocaleString()}</p>
+                      </div>
+                      <button onClick={() => deleteAccount(account.username)} className="rounded-lg bg-red-500/70 px-2 py-1 text-[11px] font-semibold">Delete</button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+              <div className="mb-3 flex items-center justify-between">
+                <h3 className="text-sm font-semibold text-white">Saved Online Games</h3>
+                <span className="text-xs text-white/40">{adminData.savedGames.length}</span>
+              </div>
+              <div className="max-h-[34rem] space-y-2 overflow-y-auto pr-1">
+                {adminData.savedGames.length === 0 ? (
+                  <p className="text-sm text-white/40">No saved online games found.</p>
+                ) : adminData.savedGames.map(game => (
+                  <div key={game.gameId} className="rounded-xl border border-white/10 bg-black/20 p-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <p className="text-sm font-medium">{game.title}</p>
+                        <p className="text-[11px] text-white/40">Host: {game.host}</p>
+                        <p className="text-[11px] text-white/40">Participants: {game.participants.join(', ') || 'none'}</p>
+                        <p className="text-[11px] text-white/40">Updated: {new Date(game.updatedAt).toLocaleString()}</p>
+                      </div>
+                      <button onClick={() => deleteServerGame(game.gameId)} className="rounded-lg bg-red-500/70 px-2 py-1 text-[11px] font-semibold">Delete</button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── Score Board ─────────────────────────────────────────────────────────────
 
 function ScoreBoard({ state, myColor }: { state: GameState; myColor?: PlayerColor | null }) {
@@ -439,6 +826,7 @@ function ScoreBoard({ state, myColor }: { state: GameState; myColor?: PlayerColo
       {state.players.map(player => {
         const colors = PLAYER_COLORS[player];
         const finished = state.tokens.filter(t => t.player === player && t.steps >= 56).length;
+        const captured = state.captureCounts[player] ?? 0;
         const isCurrent = getCurrentPlayer(state) === player;
         const isMe = myColor === player;
         return (
@@ -447,6 +835,7 @@ function ScoreBoard({ state, myColor }: { state: GameState; myColor?: PlayerColo
             <div className="w-3.5 h-3.5 rounded-full border" style={{ backgroundColor: colors.bg, borderColor: colors.dark }} />
             <span className="text-xs font-bold" style={{ color: colors.text }}>{capitalize(player)}</span>
             <span className="text-xs font-medium" style={{ color: colors.dark }}>{finished}/4</span>
+            <span className="text-xs font-medium" style={{ color: colors.dark }}>C:{captured}</span>
             {isMe && <span className="text-xs" style={{ color: colors.dark }}>⭐</span>}
           </div>
         );
@@ -469,7 +858,7 @@ function GameBoard({ gameState, boardSize, myColor, isOnline, isRolling, onToken
 
   const activeDiceValue = gameState.selectedDiceIndex !== null ? gameState.pendingDice[gameState.selectedDiceIndex] : null;
   const validMoves = gameState.diceRolled && gameState.pendingDice.length > 0 && isHuman
-    ? activeDiceValue !== null ? getValidMoves(gameState.tokens, currentPlayer, activeDiceValue) : getValidMovesForAnyDice(gameState.tokens, currentPlayer, gameState.pendingDice)
+    ? activeDiceValue !== null ? getValidMoves(gameState.tokens, currentPlayer, activeDiceValue, gameState.captureCounts) : getValidMovesForAnyDice(gameState.tokens, currentPlayer, gameState.pendingDice, gameState.captureCounts)
     : [];
   const validTokenIds = new Set(validMoves.map(t => `${t.player}-${t.id}`));
 
@@ -545,10 +934,13 @@ function GameBoard({ gameState, boardSize, myColor, isOnline, isRolling, onToken
               }) : Array.from({ length: gameState.options.diceCount }, (_, i) => <DiceFace key={i} value={null} rolling={isRolling && i === 0} />)}
             </div>
             {isHuman && !gameState.winner && (
-              <button onClick={onRollDice} disabled={gameState.diceRolled || isRolling}
-                className={`px-6 py-2.5 rounded-xl font-bold text-sm shadow-lg transition-all ${gameState.diceRolled || isRolling ? 'bg-gray-600 text-gray-400 cursor-not-allowed' : 'bg-gradient-to-r from-yellow-400 to-orange-500 text-white hover:scale-105 active:scale-95'}`}>
-                {isRolling ? 'Rolling...' : gameState.diceRolled ? 'Tap a Token' : 'Roll Dice 🎲'}
-              </button>
+              <div className="flex flex-col items-center gap-1">
+                <button onClick={onRollDice} disabled={gameState.diceRolled || isRolling}
+                  className={`px-6 py-2.5 rounded-xl font-bold text-sm shadow-lg transition-all ${gameState.diceRolled || isRolling ? 'bg-gray-600 text-gray-400 cursor-not-allowed' : 'bg-gradient-to-r from-yellow-400 to-orange-500 text-white hover:scale-105 active:scale-95'}`}>
+                  {isRolling ? 'Rolling...' : gameState.diceRolled ? 'Tap a Token' : 'Roll Dice 🎲'}
+                </button>
+                <p className="text-[11px] text-white/50">Shortcut: R or Space</p>
+              </div>
             )}
             {!isHuman && !gameState.winner && (
               <div className="px-6 py-2.5 rounded-xl bg-white/10 text-white/50 text-sm font-medium">{isOnline ? 'Waiting for player...' : 'AI thinking...'}</div>
@@ -580,6 +972,8 @@ export default function App() {
   const [gameState, setGameState] = useState<GameState | null>(null);
   const [isRolling, setIsRolling] = useState(false);
   const [boardSize, setBoardSize] = useState(0);
+  const [localSavedGames, setLocalSavedGames] = useState<SavedGameSummary[]>(() => loadLocalSavedGames());
+  const [adminPortalOpen, setAdminPortalOpen] = useState(false);
 
   // Online state
   const [socket, setSocket] = useState<Socket | null>(null);
@@ -589,6 +983,7 @@ export default function App() {
   const [invites, setInvites] = useState<InviteInfo[]>([]);
   const [myColor, setMyColor] = useState<PlayerColor | null>(null);
   const [onlineGameState, setOnlineGameState] = useState<GameState | null>(null);
+  const [onlineSavedGames, setOnlineSavedGames] = useState<SavedGameSummary[]>([]);
 
   // Local game refs
   const stateRef = useRef<GameState | null>(null);
@@ -607,6 +1002,20 @@ export default function App() {
     return () => window.removeEventListener('resize', updateSize);
   }, []);
 
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.ctrlKey && event.shiftKey && event.altKey && event.key.toLowerCase() === 'a') {
+        event.preventDefault();
+        setAdminPortalOpen(true);
+      }
+      if (event.key === 'Escape') {
+        setAdminPortalOpen(false);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, []);
+
   // ─── Socket Event Listeners ─────────────────────────────────────────────
 
   useEffect(() => {
@@ -619,15 +1028,22 @@ export default function App() {
     const onInviteRejected = (_data: { username: string }) => { /* could show toast */ };
     const onYourColor = (data: { color: PlayerColor }) => setMyColor(data.color);
     const onPlayerDisconnected = (_data: { username: string }) => { /* could show toast */ };
+    const onSavedGamesUpdated = (data: { savedGames: SavedGameSummary[] }) => setOnlineSavedGames(data.savedGames || []);
 
-    const onGameStarted = (data: { roomId: string; gameState: GameState; playerColors: Record<string, PlayerColor> }) => {
-      setOnlineGameState(data.gameState);
-      setRoomInfo(prev => prev ? { ...prev, started: true } : null);
+    const onGameStarted = (data: { roomId: string; gameState: GameState; playerColors: Record<string, PlayerColor>; room: RoomInfo }) => {
+      setOnlineGameState(normalizeGameState(data.gameState));
+      setRoomInfo(data.room);
+      setScreen('game');
+    };
+
+    const onGameResumed = (data: { roomId: string; gameState: GameState; room: RoomInfo }) => {
+      setOnlineGameState(normalizeGameState(data.gameState));
+      setRoomInfo(data.room);
       setScreen('game');
     };
 
     const onGameState = (data: { gameState: GameState }) => {
-      setOnlineGameState(data.gameState);
+      setOnlineGameState(normalizeGameState(data.gameState));
     };
 
     const onDiceRolled = (_data: { diceValues: number[] }) => {
@@ -642,10 +1058,12 @@ export default function App() {
     socket.on('room-invite', onRoomInvite);
     socket.on('invite-rejected', onInviteRejected);
     socket.on('game-started', onGameStarted);
+    socket.on('game-resumed', onGameResumed);
     socket.on('game-state', onGameState);
     socket.on('dice-rolled', onDiceRolled);
     socket.on('your-color', onYourColor);
     socket.on('player-disconnected', onPlayerDisconnected);
+    socket.on('saved-games-updated', onSavedGamesUpdated);
 
     return () => {
       socket.off('online-users', onOnlineUsers);
@@ -654,12 +1072,31 @@ export default function App() {
       socket.off('room-invite', onRoomInvite);
       socket.off('invite-rejected', onInviteRejected);
       socket.off('game-started', onGameStarted);
+      socket.off('game-resumed', onGameResumed);
       socket.off('game-state', onGameState);
       socket.off('dice-rolled', onDiceRolled);
       socket.off('your-color', onYourColor);
       socket.off('player-disconnected', onPlayerDisconnected);
+      socket.off('saved-games-updated', onSavedGamesUpdated);
     };
   }, [socket]);
+
+  useEffect(() => {
+    if (screen === 'start' || screen === 'options') {
+      setLocalSavedGames(loadLocalSavedGames());
+    }
+  }, [screen]);
+
+  useEffect(() => {
+    if (!gameState || screen !== 'game' || onlineGameState) return;
+    if (gameState.winner) {
+      removeLocalGameSnapshot(gameState.gameId);
+      setLocalSavedGames(loadLocalSavedGames());
+      return;
+    }
+    saveLocalGameSnapshot(gameState);
+    setLocalSavedGames(loadLocalSavedGames());
+  }, [gameState, screen, onlineGameState]);
 
   // ─── Local Game Logic (same as before) ─────────────────────────────────
 
@@ -701,7 +1138,7 @@ export default function App() {
             return { ...transitionToNextPlayer({ ...prev, tokens: restored, consecutiveSixes: 0 }), message: prev.options.diceCount === 1 ? `⚠️ 3 consecutive 6s! ${capitalize(player)}'s turn is reversed!` : `⚠️ 2 consecutive double 6s! ${capitalize(player)}'s turn is reversed!` };
           }
           const pendingDice = prev.options.diceCount === 1 ? [finalValues[0]] : [...finalValues];
-          const anyValid = getValidMovesForAnyDice(prev.tokens, player, pendingDice);
+          const anyValid = getValidMovesForAnyDice(prev.tokens, player, pendingDice, prev.captureCounts);
           const hasValidMoves = anyValid.length > 0;
           const extraFromDice = shouldGetExtraTurnFromDice(prev.options, finalValues);
           let message = prev.options.diceCount === 1 ? `${capitalize(player)} rolled a ${finalValues[0]}!` : `${capitalize(player)} rolled ${finalValues[0]} & ${finalValues[1]}!`;
@@ -727,9 +1164,9 @@ export default function App() {
       if (token.player !== cp) return prev;
       let diceValue: number, diceIndex: number;
       if (prev.selectedDiceIndex !== null) { diceIndex = prev.selectedDiceIndex; diceValue = prev.pendingDice[diceIndex]; }
-      else { const idx = prev.pendingDice.findIndex(dv => getValidMoves(prev.tokens, cp, dv).some(t => t.id === token.id && t.player === token.player)); if (idx === -1) return prev; diceIndex = idx; diceValue = prev.pendingDice[idx]; }
-      if (!getValidMoves(prev.tokens, cp, diceValue).some(t => t.id === token.id && t.player === token.player)) return prev;
-      const { tokens: newTokens, captured, enteredBoard } = executeMove(prev.tokens, token, diceValue);
+      else { const idx = prev.pendingDice.findIndex(dv => getValidMoves(prev.tokens, cp, dv, prev.captureCounts).some(t => t.id === token.id && t.player === token.player)); if (idx === -1) return prev; diceIndex = idx; diceValue = prev.pendingDice[idx]; }
+      if (!getValidMoves(prev.tokens, cp, diceValue, prev.captureCounts).some(t => t.id === token.id && t.player === token.player)) return prev;
+      const { tokens: newTokens, captured, enteredBoard, captureCounts } = executeMove(prev.tokens, token, diceValue, prev.captureCounts);
       const winner = checkWin(newTokens, cp) ? cp : null;
       const extraFromDice = prev.earnedExtraTurn;
       const extraFromCapture = captured && prev.options.extraTurnOnCapture;
@@ -738,8 +1175,8 @@ export default function App() {
       const newPendingDice = [...prev.pendingDice]; newPendingDice.splice(diceIndex, 1);
       const isChooseMode = prev.options.diceCount === 2 && prev.options.twoDiceMode === 'choose';
       if (isChooseMode && !prev.rollHasSix && newPendingDice.length > 0) newPendingDice.length = 0;
-      if (newPendingDice.length > 0 && getValidMovesForAnyDice(newTokens, cp, newPendingDice).length === 0) newPendingDice.length = 0;
-      const updated = { ...prev, tokens: newTokens };
+      if (newPendingDice.length > 0 && getValidMovesForAnyDice(newTokens, cp, newPendingDice, captureCounts).length === 0) newPendingDice.length = 0;
+      const updated = { ...prev, tokens: newTokens, captureCounts };
       if (newPendingDice.length === 0) {
         if (winner) return { ...updated, pendingDice: [], selectedDiceIndex: null, diceRolled: false, diceValues: [], winner, message: `🎉 ${capitalize(winner)} wins! 🎉` };
         if (anyExtraTurn) { const reasons: string[] = []; if (extraFromDice) reasons.push(prev.options.diceCount === 1 ? 'rolled 6' : 'double 6'); if (extraFromCapture) reasons.push('captured'); if (extraFromEntry) reasons.push('entered board'); return startExtraTurn({ ...updated, pendingDice: [], selectedDiceIndex: null, diceValues: [], diceRolled: false }, reasons.join(' & ')); }
@@ -772,11 +1209,11 @@ export default function App() {
         if (!cs || !cs.diceRolled || cs.pendingDice.length === 0) return;
         const aiPlayer = getCurrentPlayer(cs);
         if (cs.pendingDice.length > 1) {
-          const move = getAIMoveTwoDice(cs.tokens, aiPlayer, cs.pendingDice);
+          const move = getAIMoveTwoDice(cs.tokens, aiPlayer, cs.pendingDice, cs.captureCounts);
           if (move) { setGameState(p => p ? { ...p, selectedDiceIndex: move.diceIndex } : null); setTimeout(() => handleTokenClick(move.token), 300); }
           else handleNoMoves();
         } else {
-          const move = getAIMove(cs.tokens, aiPlayer, cs.pendingDice[0]);
+          const move = getAIMove(cs.tokens, aiPlayer, cs.pendingDice[0], cs.captureCounts);
           if (move) handleTokenClick(move); else handleNoMoves();
         }
       }, 700);
@@ -789,7 +1226,7 @@ export default function App() {
     const state = stateRef.current;
     if (!state || state.winner || !state.diceRolled || state.pendingDice.length === 0 || state.isTransitioning) return;
     if (!isHumanTurn(state)) return;
-    if (getValidMovesForAnyDice(state.tokens, getCurrentPlayer(state), state.pendingDice).length === 0) {
+    if (getValidMovesForAnyDice(state.tokens, getCurrentPlayer(state), state.pendingDice, state.captureCounts).length === 0) {
       const t = setTimeout(() => handleNoMoves(), 1000); return () => clearTimeout(t);
     }
   }, [gameState?.diceRolled, gameState?.pendingDice.length, gameState?.isTransitioning]);
@@ -803,6 +1240,27 @@ export default function App() {
     socket.emit('roll-dice', { roomId: roomInfo.id });
   }, [socket, roomInfo, onlineGameState, myColor]);
 
+  useEffect(() => {
+    const onRollShortcut = (event: KeyboardEvent) => {
+      if (event.repeat) return;
+      if (screen !== 'game' || adminPortalOpen) return;
+      if (isEditableTarget(event.target)) return;
+
+      const isRollShortcut = event.key.toLowerCase() === 'r' || event.code === 'Space';
+      if (!isRollShortcut) return;
+
+      event.preventDefault();
+      if (onlineGameState) {
+        onlineRollDice();
+        return;
+      }
+      rollDice();
+    };
+
+    window.addEventListener('keydown', onRollShortcut);
+    return () => window.removeEventListener('keydown', onRollShortcut);
+  }, [screen, adminPortalOpen, onlineGameState, onlineRollDice, rollDice]);
+
   const onlineSelectDice = useCallback((index: number) => {
     if (!socket || !roomInfo) return;
     socket.emit('select-dice', { roomId: roomInfo.id, diceIndex: index });
@@ -815,31 +1273,64 @@ export default function App() {
     socket.emit('move-token', { roomId: roomInfo.id, tokenId: token.id, player: token.player });
   }, [socket, roomInfo, onlineGameState, myColor]);
 
+  const resumeLocalGame = useCallback((gameId: string) => {
+    const savedGames = loadLocalSavedGames();
+    const savedGame = savedGames.find(game => game.gameId === gameId);
+    if (!savedGame) return;
+    setOnlineGameState(null);
+    setSocket(prev => {
+      if (prev) {
+        prev.disconnect();
+      }
+      return null;
+    });
+    setRoomInfo(null);
+    setMyColor(null);
+    setInvites([]);
+    setGameState(normalizeGameState(savedGame.gameState));
+    setScreen('game');
+  }, []);
+
+  const resumeOnlineGame = useCallback((gameId: string) => {
+    if (!socket) return;
+    socket.emit('resume-game', { gameId });
+  }, [socket]);
+
+  const adminPortal = (
+    <AdminPortal
+      open={adminPortalOpen}
+      onClose={() => setAdminPortalOpen(false)}
+      onRefreshLocal={() => setLocalSavedGames(loadLocalSavedGames())}
+    />
+  );
+
 
 
   // ─── Render Screens ────────────────────────────────────────────────────
 
   if (screen === 'start') {
-    return <StartScreen onLocal={() => setScreen('options')} onOnline={() => setScreen('online-login')} />;
+    return <>{adminPortal}<StartScreen onLocal={() => setScreen('options')} onOnline={() => setScreen('online-login')} savedGames={localSavedGames} onResumeLocal={resumeLocalGame} /></>;
   }
 
   if (screen === 'options') {
-    return <OptionsScreen onStart={(options, pc) => {
+    return <>{adminPortal}<OptionsScreen onStart={(options, pc) => {
       const players: PlayerColor[] = ['green','yellow','red','blue'].slice(0, pc) as PlayerColor[];
       setGameState(createInitialState(players, options));
       setScreen('game');
-    }} onBack={() => setScreen('start')} />;
+    }} onBack={() => setScreen('start')} /></>;
   }
 
   if (screen === 'online-login') {
-    return <OnlineLoginScreen onConnect={(sock, uname) => {
-      setSocket(sock); setOnlineUsername(uname); setScreen('online-lobby');
-    }} />;
+    return <>{adminPortal}<OnlineLoginScreen onConnect={(sock, uname, savedGames) => {
+      setSocket(sock); setOnlineUsername(uname); setOnlineSavedGames(savedGames); setScreen('online-lobby');
+    }} /></>;
   }
 
   if (screen === 'online-lobby') {
-    return <OnlineLobbyScreen socket={socket!} username={onlineUsername} onlineUsers={onlineUsers} roomInfo={roomInfo} invites={invites}
-      onBack={() => { socket?.disconnect(); setSocket(null); setRoomInfo(null); setInvites([]); setOnlineUsers([]); setScreen('start'); }} />;
+    return <>{adminPortal}<OnlineLobbyScreen socket={socket!} username={onlineUsername} onlineUsers={onlineUsers} roomInfo={roomInfo} invites={invites} savedGames={onlineSavedGames}
+      onResumeGame={resumeOnlineGame}
+      onBack={() => { socket?.disconnect(); setSocket(null); setRoomInfo(null); setInvites([]); setOnlineUsers([]); setOnlineSavedGames([]); setScreen('start'); }} />;
+    </>;
   }
 
   // ─── Game Screen ────────────────────────────────────────────────────────
@@ -850,13 +1341,42 @@ export default function App() {
 
     if (!gs) { setScreen('start'); return null; }
 
+    if (isOnline && roomInfo?.paused) {
+      const isHost = roomInfo.host === onlineUsername;
+      return (
+        <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 p-4 text-center">
+          <div className="max-w-md w-full bg-white/10 backdrop-blur-lg border border-white/20 rounded-3xl p-6 shadow-2xl">
+            <h2 className="text-white text-2xl font-bold mb-2">Game paused</h2>
+            <p className="text-white/60 text-sm mb-4">A player left the match. Choose how to continue.</p>
+            {roomInfo.vacantSlots?.length ? (
+              <div className="mb-4 space-y-2 text-left">
+                {roomInfo.vacantSlots.map(slot => (
+                  <div key={`${slot.username}-${slot.color}`} className="flex items-center justify-between rounded-xl bg-white/5 px-3 py-2">
+                    <span className="text-white text-sm">{capitalize(slot.username)} left</span>
+                    <span className="text-white/40 text-xs">{capitalize(slot.color)}</span>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+            {isHost ? (
+              <div className="flex flex-col gap-3">
+                <button onClick={() => setScreen('online-lobby')} className="px-4 py-3 rounded-xl bg-blue-500 text-white font-semibold">Invite a replacement</button>
+                <button disabled={!roomInfo.vacantSlots?.length} onClick={() => socket?.emit('continue-without-player', { roomId: roomInfo.id, playerName: roomInfo.vacantSlots?.[0]?.username })} className="px-4 py-3 rounded-xl bg-green-500 text-white font-semibold disabled:opacity-40">Continue without them</button>
+              </div>
+            ) : (
+              <p className="text-white/50 text-sm">Waiting for the host to decide.</p>
+            )}
+          </div>
+        </div>
+      );
+    }
+
     // Pass & Play transition
     if (!isOnline && gs.isTransitioning) {
       const player = getCurrentPlayer(gs);
       const colors = PLAYER_COLORS[player];
       const reversalMsg = gs.message.includes('reversed') ? gs.message : undefined;
-      return (
-        <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-br from-slate-900 to-slate-800 p-4">
+      return <>{adminPortal}<div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-br from-slate-900 to-slate-800 p-4">
           <div className="text-center">
             <div className="w-24 h-24 rounded-full mx-auto mb-6 shadow-2xl flex items-center justify-center" style={{ backgroundColor: colors.bg, border: `4px solid ${colors.dark}` }}>
               <span className="text-4xl font-bold text-white">{capitalize(player).charAt(0)}</span>
@@ -866,11 +1386,10 @@ export default function App() {
             <p className="text-white/50 text-sm mb-8">Pass the device to the {capitalize(player)} player</p>
             <button onClick={handleReady} className="px-8 py-3 rounded-xl text-white font-bold text-lg shadow-lg hover:scale-105 transition-transform active:scale-95" style={{ backgroundColor: colors.bg }}>I'm Ready! 👋</button>
           </div>
-        </div>
-      );
+        </div></>;
     }
 
-    return <GameBoard gameState={gs} boardSize={boardSize} myColor={myColor} isOnline={isOnline} isRolling={isRolling}
+    return <>{adminPortal}<GameBoard gameState={gs} boardSize={boardSize} myColor={myColor} isOnline={isOnline} isRolling={isRolling}
       onTokenClick={isOnline ? onlineMoveToken : handleTokenClick}
       onRollDice={isOnline ? onlineRollDice : rollDice}
       onSelectDice={isOnline ? onlineSelectDice : handleSelectDice}
@@ -878,7 +1397,7 @@ export default function App() {
         if (isOnline) { socket?.disconnect(); setSocket(null); setOnlineGameState(null); setRoomInfo(null); setMyColor(null); setInvites([]); }
         else { setGameState(null); }
         setScreen('start');
-      }} />;
+      }} /></>;
   }
 
   return null;
