@@ -23,7 +23,10 @@ export interface GameState {
   pendingDice: number[];
   selectedDiceIndex: number | null;
   diceRolled: boolean;
+  // Winner is set only when the game actually ends (3rd player finishes)
   winner: PlayerColor | null;
+  // Order in which players finished (1st, 2nd, 3rd). The 4th place is whoever is left.
+  finishedOrder: PlayerColor[];
   gameStarted: boolean;
   message: string;
   options: GameOptions;
@@ -226,8 +229,120 @@ export function executeMove(tokens: Token[], token: Token, diceValue: number, ca
   return { tokens: newTokens, captured, enteredBoard, captureCounts: newCaptureCounts };
 }
 
+// ─── Mandatory capture helpers ───────────────────────────────────────────────
+
+// Returns true if moving `token` by `diceValue` would land on an opponent's
+// piece (i.e. result in a capture) AND that landing square is not a safe
+// square.
+function moveWouldCapture(tokens: Token[], token: Token, diceValue: number): boolean {
+  // Coming out of home base (-1) goes to start square; that's its own "entry" rule,
+  // not a capture.
+  if (token.steps === -1) return false;
+  const newSteps = token.steps + diceValue;
+  if (newSteps < 0 || newSteps > 50) return false;
+  const pathIndex = (START_INDICES[token.player] + newSteps) % 52;
+  if (isSafePosition(pathIndex)) return false;
+  return tokens.some(
+    ot => ot.player !== token.player && ot.steps >= 0 && ot.steps <= 50 &&
+      (START_INDICES[ot.player] + ot.steps) % 52 === pathIndex
+  );
+}
+
+// Returns the subset of `moves` that, with the given dice value, would capture.
+export function getCaptureAvailableTokens(
+  tokens: Token[],
+  moves: Token[],
+  diceValue: number,
+): Token[] {
+  return moves.filter(t => moveWouldCapture(tokens, t, diceValue));
+}
+
+// True if any of the player's currently valid moves (for the given dice value)
+// would capture an opponent.
+export function hasCaptureAvailable(
+  tokens: Token[],
+  player: PlayerColor,
+  diceValue: number,
+  captureCounts: Record<PlayerColor, number>,
+): boolean {
+  const moves = getValidMoves(tokens, player, diceValue, captureCounts);
+  return getCaptureAvailableTokens(tokens, moves, diceValue).length > 0;
+}
+
+// True if any of the player's valid moves across any pending die would capture.
+export function hasCaptureAvailableForAnyDice(
+  tokens: Token[],
+  player: PlayerColor,
+  pendingDice: number[],
+  captureCounts: Record<PlayerColor, number>,
+): boolean {
+  for (const dv of pendingDice) {
+    if (hasCaptureAvailable(tokens, player, dv, captureCounts)) return true;
+  }
+  return false;
+}
+
+// Returns the set of `player`'s token IDs that, with `diceValue`, could have
+// captured an opponent piece (i.e. moved onto an opponent on a non-safe
+// square) in the given tokens layout, EXCLUDING `chosenToken.id`.
+export function getCapturableTokenIds(
+  tokens: Token[],
+  player: PlayerColor,
+  chosenToken: Token,
+  diceValue: number,
+): Set<number> {
+  const ids = new Set<number>();
+  for (const t of tokens) {
+    if (t.player !== player) continue;
+    if (t.id === chosenToken.id) continue;
+    if (t.steps === -1 || t.steps >= 56) continue;
+    if (moveWouldCapture(tokens, t, diceValue)) {
+      ids.add(t.id);
+    }
+  }
+  return ids;
+}
+
+// Apply the mandatory-capture penalty: send home any of `player`'s tokens
+// (in `tokensToUpdate`) whose IDs are in `capturableIds`, EXCEPT for the
+// chosen token. The captureCounts are passed through unchanged.
+export function applyMandatoryCapturePenalty(
+  tokensToUpdate: Token[],
+  player: PlayerColor,
+  chosenToken: Token,
+  capturableIds: Set<number>,
+): { tokens: Token[] } {
+  const newTokens = tokensToUpdate.map(t => {
+    if (t.player !== player) return t;
+    if (t.id === chosenToken.id) return t;
+    if (capturableIds.has(t.id) && t.steps !== -1) {
+      return { ...t, steps: -1 };
+    }
+    return t;
+  });
+  return { tokens: newTokens };
+}
+
 export function checkWin(tokens: Token[], player: PlayerColor): boolean {
   return tokens.filter(t => t.player === player).every(t => t.steps >= 56);
+}
+
+// True if `player` has all four pieces home (steps >= 56). Used for
+// ranking — the game ends when the 3rd player finishes, not the 1st.
+export function hasPlayerFinished(tokens: Token[], player: PlayerColor): boolean {
+  return tokens.filter(t => t.player === player).every(t => t.steps >= 56);
+}
+
+// Add a player to the finished order if they have just gotten all four pieces
+// home AND they aren't already in the list. Returns a new finishedOrder array.
+export function registerFinishedPlayer(
+  finishedOrder: PlayerColor[],
+  player: PlayerColor,
+  tokens: Token[],
+): PlayerColor[] {
+  if (finishedOrder.includes(player)) return finishedOrder;
+  if (!hasPlayerFinished(tokens, player)) return finishedOrder;
+  return [...finishedOrder, player];
 }
 
 // Check if a dice roll should give an extra turn
@@ -377,6 +492,7 @@ export function createInitialState(players: PlayerColor[], options: GameOptions)
     consecutiveSixes: 0,
     rollHasSix: false,
     captureCounts: createEmptyCaptureCounts(),
+    finishedOrder: [],
   };
 }
 
