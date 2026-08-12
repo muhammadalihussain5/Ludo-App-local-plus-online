@@ -3,10 +3,12 @@ import { io, Socket } from 'socket.io-client';
 import {
   type PlayerColor, type GameState, type Token, type GameOptions,
   PLAYER_COLORS, START_INDICES, getCellInfo, getTokenPosition,
-  getValidMoves, getValidMovesForAnyDice, executeMove, checkWin,
+  getValidMoves, getValidMovesForAnyDice, executeMove,
   createInitialState, createEmptyCaptureCounts, getCurrentPlayer, isHumanTurn, capitalize,
   shouldReverseTurn, shouldGetExtraTurnFromDice, rollHasSix, isDoubleSix,
   getAIMove, getAIMoveTwoDice,
+  hasCaptureAvailable, applyMandatoryCapturePenalty, getCapturableTokenIds,
+  registerFinishedPlayer, hasPlayerFinished,
 } from './gameLogic';
 
 const DEFAULT_OPTIONS: GameOptions = {
@@ -39,6 +41,18 @@ interface RoomInfo {
 }
 
 interface InviteInfo { roomId: string; from: string; playerCount: number; }
+
+interface PositionStats {
+  first: number;
+  second: number;
+  third: number;
+  fourth: number;
+  gamesPlayed: number;
+}
+
+function emptyPositionStats(): PositionStats {
+  return { first: 0, second: 0, third: 0, fourth: 0, gamesPlayed: 0 };
+}
 
 interface AdminAccountRecord {
   username: string;
@@ -82,6 +96,7 @@ function normalizeGameState(state: GameState): GameState {
     ...state,
     gameId: state.gameId || (globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`),
     captureCounts: state.captureCounts || createBlankCaptureCounts(),
+    finishedOrder: state.finishedOrder || [],
   };
 }
 
@@ -327,7 +342,7 @@ function OptionsScreen({ onStart, onBack }: { onStart: (o: GameOptions, pc: numb
 
 // ─── Online Login Screen ─────────────────────────────────────────────────────
 
-function OnlineLoginScreen({ onConnect }: { onConnect: (socket: Socket, username: string) => void }) {
+function OnlineLoginScreen({ onConnect }: { onConnect: (socket: Socket, username: string, savedGames: SavedGameSummary[], positionStats: PositionStats | null) => void }) {
   const [serverUrl, setServerUrl] = useState(() => import.meta.env.VITE_SERVER_URL || 'https://ludo-app-local-plus-online.onrender.com/');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -347,9 +362,9 @@ function OnlineLoginScreen({ onConnect }: { onConnect: (socket: Socket, username
       socket.emit(mode === 'create' ? 'create-account' : 'login', { username: username.trim(), password });
     });
 
-    socket.on('login-success', (data: { username: string; savedGames: SavedGameSummary[] }) => {
+    socket.on('login-success', (data: { username: string; savedGames: SavedGameSummary[]; positionStats: PositionStats | null }) => {
       setConnecting(false);
-      onConnect(socket, data.username, data.savedGames || []);
+      onConnect(socket, data.username, data.savedGames || [], data.positionStats ?? null);
     });
 
     socket.on('login-error', (data: { message: string }) => {
@@ -428,9 +443,10 @@ function OnlineLoginScreen({ onConnect }: { onConnect: (socket: Socket, username
 
 // ─── Online Lobby Screen ─────────────────────────────────────────────────────
 
-function OnlineLobbyScreen({ socket, username, onlineUsers, roomInfo, invites, savedGames, onBack, onResumeGame }: {
+function OnlineLobbyScreen({ socket, username, onlineUsers, roomInfo, invites, savedGames, positionStats, onBack, onResumeGame }: {
   socket: Socket; username: string; onlineUsers: string[]; roomInfo: RoomInfo | null;
-  invites: InviteInfo[]; savedGames: SavedGameSummary[]; onBack: () => void; onResumeGame: (gameId: string) => void;
+  invites: InviteInfo[]; savedGames: SavedGameSummary[]; positionStats: PositionStats | null;
+  onBack: () => void; onResumeGame: (gameId: string) => void;
 }) {
   const [playerCount, setPlayerCount] = useState(4);
   const [options, setOptions] = useState<GameOptions>({ ...DEFAULT_OPTIONS, isAIMode: false });
@@ -578,6 +594,39 @@ function OnlineLobbyScreen({ socket, username, onlineUsers, roomInfo, invites, s
                 </button>
               ))}
             </div>
+          </div>
+        )}
+
+        {/* Player Stats — only shown when not in a room and the user has stats */}
+        {!roomInfo && positionStats && (positionStats.gamesPlayed || 0) > 0 && (
+          <div className="bg-gradient-to-br from-amber-500/15 to-yellow-500/10 border border-amber-500/30 rounded-2xl p-4 mb-4">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-amber-300 font-semibold text-sm">🏆 Your Game History</h3>
+              <span className="text-amber-200/60 text-xs">{positionStats.gamesPlayed} games</span>
+            </div>
+            <div className="grid grid-cols-4 gap-2">
+              <div className="flex flex-col items-center justify-center rounded-xl bg-yellow-500/20 border border-yellow-500/40 p-2">
+                <span className="text-lg">🥇</span>
+                <span className="text-yellow-200 text-xs font-medium">1st</span>
+                <span className="text-white text-lg font-bold leading-none mt-0.5">{positionStats.first}</span>
+              </div>
+              <div className="flex flex-col items-center justify-center rounded-xl bg-slate-300/20 border border-slate-300/40 p-2">
+                <span className="text-lg">🥈</span>
+                <span className="text-slate-200 text-xs font-medium">2nd</span>
+                <span className="text-white text-lg font-bold leading-none mt-0.5">{positionStats.second}</span>
+              </div>
+              <div className="flex flex-col items-center justify-center rounded-xl bg-orange-700/20 border border-orange-600/40 p-2">
+                <span className="text-lg">🥉</span>
+                <span className="text-orange-200 text-xs font-medium">3rd</span>
+                <span className="text-white text-lg font-bold leading-none mt-0.5">{positionStats.third}</span>
+              </div>
+              <div className="flex flex-col items-center justify-center rounded-xl bg-white/5 border border-white/15 p-2">
+                <span className="text-lg">4️⃣</span>
+                <span className="text-white/70 text-xs font-medium">4th</span>
+                <span className="text-white text-lg font-bold leading-none mt-0.5">{positionStats.fourth}</span>
+              </div>
+            </div>
+            <p className="text-amber-200/50 text-[11px] mt-2 text-center">Game ends when the 3rd player finishes, so all players are ranked.</p>
           </div>
         )}
 
@@ -821,6 +870,7 @@ function AdminPortal({
 // ─── Score Board ─────────────────────────────────────────────────────────────
 
 function ScoreBoard({ state, myColor }: { state: GameState; myColor?: PlayerColor | null }) {
+  const finishedOrder = state.finishedOrder || [];
   return (
     <div className="flex gap-2 flex-wrap justify-center">
       {state.players.map(player => {
@@ -829,6 +879,8 @@ function ScoreBoard({ state, myColor }: { state: GameState; myColor?: PlayerColo
         const captured = state.captureCounts[player] ?? 0;
         const isCurrent = getCurrentPlayer(state) === player;
         const isMe = myColor === player;
+        const placeIdx = finishedOrder.indexOf(player);
+        const placeLabel = placeIdx >= 0 ? `${placeIdx + 1}st` : '';
         return (
           <div key={player} className={`flex items-center gap-1.5 px-2.5 py-1 rounded-xl border-2 transition-all duration-300 ${isCurrent ? 'scale-110 shadow-lg' : 'opacity-60'}`}
             style={{ backgroundColor: colors.light, borderColor: isCurrent ? colors.dark : colors.border }}>
@@ -836,6 +888,7 @@ function ScoreBoard({ state, myColor }: { state: GameState; myColor?: PlayerColo
             <span className="text-xs font-bold" style={{ color: colors.text }}>{capitalize(player)}</span>
             <span className="text-xs font-medium" style={{ color: colors.dark }}>{finished}/4</span>
             <span className="text-xs font-medium" style={{ color: colors.dark }}>C:{captured}</span>
+            {placeLabel && <span className="text-xs font-bold" style={{ color: colors.dark }}>🏁{placeLabel}</span>}
             {isMe && <span className="text-xs" style={{ color: colors.dark }}>⭐</span>}
           </div>
         );
@@ -954,12 +1007,29 @@ function GameBoard({ gameState, boardSize, myColor, isOnline, isRolling, onToken
             })}
           </div>
         </div>
-        {gameState.winner && (
-          <div className="mt-4 text-center">
-            <div className="inline-block px-8 py-4 rounded-2xl font-bold text-xl text-white shadow-xl animate-bounce" style={{ backgroundColor: PLAYER_COLORS[gameState.winner].bg }}>🎉 {capitalize(gameState.winner)} Wins! 🎉</div>
-            <div className="mt-3"><button onClick={onNewGame} className="px-6 py-2 bg-white/20 text-white rounded-xl font-medium hover:bg-white/30 transition-colors">Play Again</button></div>
-          </div>
-        )}
+        {gameState.winner && (() => {
+          const finishedOrder = gameState.finishedOrder || [];
+          const remaining = gameState.players.filter(p => !finishedOrder.includes(p));
+          const fourth = remaining[0] ?? null;
+          const ranking = [...finishedOrder.slice(0, 3), ...(fourth ? [fourth] : [])];
+          const placeLabels = ['1st', '2nd', '3rd', '4th'];
+          const placeEmojis = ['🥇', '🥈', '🥉', '4️⃣'];
+          return (
+            <div className="mt-4 text-center">
+              <div className="inline-block px-8 py-4 rounded-2xl font-bold text-xl text-white shadow-xl animate-bounce" style={{ backgroundColor: PLAYER_COLORS[gameState.winner].bg }}>🏆 {capitalize(gameState.winner)} wins! 🏆</div>
+              <div className="mt-3 flex flex-wrap items-center justify-center gap-2">
+                {ranking.map((p, i) => (
+                  <div key={p} className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl border-2" style={{ backgroundColor: PLAYER_COLORS[p].light, borderColor: PLAYER_COLORS[p].dark }}>
+                    <span className="text-base">{placeEmojis[i]}</span>
+                    <span className="text-sm font-bold" style={{ color: PLAYER_COLORS[p].text }}>{placeLabels[i]}</span>
+                    <span className="text-sm font-semibold text-white/90" style={{ color: PLAYER_COLORS[p].dark }}>{capitalize(p)}</span>
+                  </div>
+                ))}
+              </div>
+              <div className="mt-3"><button onClick={onNewGame} className="px-6 py-2 bg-white/20 text-white rounded-xl font-medium hover:bg-white/30 transition-colors">Play Again</button></div>
+            </div>
+          );
+        })()}
       </div>
     </div>
   );
@@ -984,6 +1054,7 @@ export default function App() {
   const [myColor, setMyColor] = useState<PlayerColor | null>(null);
   const [onlineGameState, setOnlineGameState] = useState<GameState | null>(null);
   const [onlineSavedGames, setOnlineSavedGames] = useState<SavedGameSummary[]>([]);
+  const [positionStats, setPositionStats] = useState<PositionStats | null>(null);
 
   // Local game refs
   const stateRef = useRef<GameState | null>(null);
@@ -1029,6 +1100,7 @@ export default function App() {
     const onYourColor = (data: { color: PlayerColor }) => setMyColor(data.color);
     const onPlayerDisconnected = (_data: { username: string }) => { /* could show toast */ };
     const onSavedGamesUpdated = (data: { savedGames: SavedGameSummary[] }) => setOnlineSavedGames(data.savedGames || []);
+    const onPositionStats = (data: { positionStats: PositionStats }) => setPositionStats(data.positionStats || emptyPositionStats());
 
     const onGameStarted = (data: { roomId: string; gameState: GameState; playerColors: Record<string, PlayerColor>; room: RoomInfo }) => {
       setOnlineGameState(normalizeGameState(data.gameState));
@@ -1064,6 +1136,7 @@ export default function App() {
     socket.on('your-color', onYourColor);
     socket.on('player-disconnected', onPlayerDisconnected);
     socket.on('saved-games-updated', onSavedGamesUpdated);
+    socket.on('position-stats', onPositionStats);
 
     return () => {
       socket.off('online-users', onOnlineUsers);
@@ -1078,6 +1151,7 @@ export default function App() {
       socket.off('your-color', onYourColor);
       socket.off('player-disconnected', onPlayerDisconnected);
       socket.off('saved-games-updated', onSavedGamesUpdated);
+      socket.off('position-stats', onPositionStats);
     };
   }, [socket]);
 
@@ -1101,7 +1175,19 @@ export default function App() {
   // ─── Local Game Logic (same as before) ─────────────────────────────────
 
   const transitionToNextPlayer = useCallback((prev: GameState, overrideIndex?: number): GameState => {
-    const npi = overrideIndex !== undefined ? overrideIndex : (prev.currentPlayerIndex + 1) % prev.players.length;
+    // Find the next non-finished player. If the game already has a winner
+    // (i.e. 3 players have finished) we keep currentPlayerIndex as-is.
+    const finished = prev.finishedOrder || [];
+    let npi = overrideIndex !== undefined ? overrideIndex : (prev.currentPlayerIndex + 1) % prev.players.length;
+    if (prev.winner) {
+      return { ...prev, diceRolled: false, diceValues: [], pendingDice: [], selectedDiceIndex: null, earnedExtraTurn: false, consecutiveSixes: 0, rollHasSix: false, isTransitioning: false };
+    }
+    if (finished.length > 0) {
+      let safety = prev.players.length;
+      while (safety-- > 0 && finished.includes(prev.players[npi])) {
+        npi = (npi + 1) % prev.players.length;
+      }
+    }
     const np = prev.players[npi];
     return { ...prev, diceRolled: false, diceValues: [], pendingDice: [], selectedDiceIndex: null, currentPlayerIndex: npi, earnedExtraTurn: false, consecutiveSixes: 0, rollHasSix: false, message: `${capitalize(np)}'s turn - Roll the dice!`, isTransitioning: !prev.options.isAIMode && prev.players.length > 1, turnSnapshot: prev.tokens.map(t => ({ ...t })) };
   }, []);
@@ -1166,8 +1252,37 @@ export default function App() {
       if (prev.selectedDiceIndex !== null) { diceIndex = prev.selectedDiceIndex; diceValue = prev.pendingDice[diceIndex]; }
       else { const idx = prev.pendingDice.findIndex(dv => getValidMoves(prev.tokens, cp, dv, prev.captureCounts).some(t => t.id === token.id && t.player === token.player)); if (idx === -1) return prev; diceIndex = idx; diceValue = prev.pendingDice[idx]; }
       if (!getValidMoves(prev.tokens, cp, diceValue, prev.captureCounts).some(t => t.id === token.id && t.player === token.player)) return prev;
-      const { tokens: newTokens, captured, enteredBoard, captureCounts } = executeMove(prev.tokens, token, diceValue, prev.captureCounts);
-      const winner = checkWin(newTokens, cp) ? cp : null;
+      const { tokens: movedTokens, captured, enteredBoard, captureCounts } = executeMove(prev.tokens, token, diceValue, prev.captureCounts);
+
+      // ─── Mandatory capture penalty ───────────────────────────────────────
+      // If a capture was available with this dice value but the player did
+      // NOT take it, send home any of their other pieces that COULD have
+      // captured. The piece they actually moved stays where it is.
+      // We compute the set of capturable token IDs from the ORIGINAL state,
+      // then apply the penalty on top of `movedTokens` so the player's move
+      // is preserved while missed-capture pieces are sent home.
+      let newTokens = movedTokens;
+      let newCaptureCounts = captureCounts;
+      let penaltyMessage = '';
+      if (!captured && hasCaptureAvailable(prev.tokens, cp, diceValue, prev.captureCounts)) {
+        const capturableIds = getCapturableTokenIds(prev.tokens, cp, token, diceValue);
+        if (capturableIds.size > 0) {
+          const penalty = applyMandatoryCapturePenalty(movedTokens, cp, token, capturableIds);
+          newTokens = penalty.tokens;
+          penaltyMessage = ' ⚠️ Missed a capture — your capturable pieces were sent home!';
+        }
+      }
+
+      // ─── Ranking & game-end logic ───────────────────────────────────────
+      // The current player may have just finished. If so, add them to the
+      // finishedOrder. The game ends when 3 players have finished.
+      const playerFinished = hasPlayerFinished(newTokens, cp);
+      const finishedOrder = playerFinished
+        ? registerFinishedPlayer(prev.finishedOrder, cp, newTokens)
+        : prev.finishedOrder;
+      const shouldEndGame = finishedOrder.length >= 3 && prev.players.length >= 3;
+      const winner = shouldEndGame ? (finishedOrder[0] ?? null) : null;
+
       const extraFromDice = prev.earnedExtraTurn;
       const extraFromCapture = captured && prev.options.extraTurnOnCapture;
       const extraFromEntry = enteredBoard && prev.options.extraRollOnEntry;
@@ -1175,14 +1290,31 @@ export default function App() {
       const newPendingDice = [...prev.pendingDice]; newPendingDice.splice(diceIndex, 1);
       const isChooseMode = prev.options.diceCount === 2 && prev.options.twoDiceMode === 'choose';
       if (isChooseMode && !prev.rollHasSix && newPendingDice.length > 0) newPendingDice.length = 0;
-      if (newPendingDice.length > 0 && getValidMovesForAnyDice(newTokens, cp, newPendingDice, captureCounts).length === 0) newPendingDice.length = 0;
-      const updated = { ...prev, tokens: newTokens, captureCounts };
+      if (newPendingDice.length > 0 && getValidMovesForAnyDice(newTokens, cp, newPendingDice, newCaptureCounts).length === 0) newPendingDice.length = 0;
+      const updated = { ...prev, tokens: newTokens, captureCounts: newCaptureCounts, finishedOrder };
       if (newPendingDice.length === 0) {
-        if (winner) return { ...updated, pendingDice: [], selectedDiceIndex: null, diceRolled: false, diceValues: [], winner, message: `🎉 ${capitalize(winner)} wins! 🎉` };
+        if (winner) {
+          // Final ranking: 1st, 2nd, 3rd from finishedOrder, 4th is whoever
+          // remains in `prev.players` but not in finishedOrder.
+          const remaining = prev.players.filter(p => !finishedOrder.includes(p));
+          const fourth = remaining[0] ?? null;
+          const ranking = [...finishedOrder.slice(0, 3), ...(fourth ? [fourth] : [])];
+          const rankingText = ranking.map((p, i) => `${i + 1}. ${capitalize(p)}`).join(' • ');
+          return { ...updated, pendingDice: [], selectedDiceIndex: null, diceRolled: false, diceValues: [], winner, message: `🏆 Game over! ${rankingText}` };
+        }
+        if (playerFinished && !shouldEndGame) {
+          // Mark the player's finish in the message and let the game continue
+          // for the remaining players.
+          const place = finishedOrder.length; // 1, 2, or 3
+          const suffix = place === 1 ? '1st' : place === 2 ? '2nd' : '3rd';
+          // End the current player's turn so the next player rolls.
+          const nextState = transitionToNextPlayer({ ...updated, pendingDice: [], selectedDiceIndex: null, diceValues: [], diceRolled: false });
+          return { ...nextState, message: `🎉 ${capitalize(cp)} finished in ${suffix} place! ${nextState.message}` };
+        }
         if (anyExtraTurn) { const reasons: string[] = []; if (extraFromDice) reasons.push(prev.options.diceCount === 1 ? 'rolled 6' : 'double 6'); if (extraFromCapture) reasons.push('captured'); if (extraFromEntry) reasons.push('entered board'); return startExtraTurn({ ...updated, pendingDice: [], selectedDiceIndex: null, diceValues: [], diceRolled: false }, reasons.join(' & ')); }
         return transitionToNextPlayer({ ...updated, pendingDice: [], selectedDiceIndex: null, diceValues: [], diceRolled: false });
       }
-      return { ...updated, pendingDice: newPendingDice, selectedDiceIndex: newPendingDice.length === 1 ? 0 : null, earnedExtraTurn: anyExtraTurn, message: newPendingDice.length === 1 ? `Tap a token to move ${newPendingDice[0]} steps.` : 'Select a die, then tap a token.' };
+      return { ...updated, pendingDice: newPendingDice, selectedDiceIndex: newPendingDice.length === 1 ? 0 : null, earnedExtraTurn: anyExtraTurn, message: (newPendingDice.length === 1 ? `Tap a token to move ${newPendingDice[0]} steps.` : 'Select a die, then tap a token.') + penaltyMessage };
     });
   }, [transitionToNextPlayer, startExtraTurn]);
 
@@ -1202,6 +1334,11 @@ export default function App() {
     const state = stateRef.current;
     if (!state || state.winner || rollingRef.current || state.isTransitioning) return;
     if (isHumanTurn(state)) return;
+    // If current player already finished, just advance.
+    if ((state.finishedOrder || []).includes(getCurrentPlayer(state))) {
+      const t = setTimeout(() => handleNoMoves(), 400);
+      return () => clearTimeout(t);
+    }
     if (!state.diceRolled) { const t = setTimeout(() => rollDice(), 900); return () => clearTimeout(t); }
     else if (state.pendingDice.length > 0) {
       const t = setTimeout(() => {
@@ -1219,7 +1356,7 @@ export default function App() {
       }, 700);
       return () => clearTimeout(t);
     }
-  }, [gameState?.currentPlayerIndex, gameState?.diceRolled, gameState?.pendingDice.length, gameState?.winner, gameState?.isTransitioning]);
+  }, [gameState?.currentPlayerIndex, gameState?.diceRolled, gameState?.pendingDice.length, gameState?.winner, gameState?.isTransitioning, handleNoMoves]);
 
   // Auto-pass when no valid moves (human)
   useEffect(() => {
@@ -1229,7 +1366,7 @@ export default function App() {
     if (getValidMovesForAnyDice(state.tokens, getCurrentPlayer(state), state.pendingDice, state.captureCounts).length === 0) {
       const t = setTimeout(() => handleNoMoves(), 1000); return () => clearTimeout(t);
     }
-  }, [gameState?.diceRolled, gameState?.pendingDice.length, gameState?.isTransitioning]);
+  }, [gameState?.diceRolled, gameState?.pendingDice.length, gameState?.isTransitioning, handleNoMoves]);
 
   // ─── Online Game Actions ────────────────────────────────────────────────
 
@@ -1249,17 +1386,27 @@ export default function App() {
       const isRollShortcut = event.key.toLowerCase() === 'r' || event.code === 'Space';
       if (!isRollShortcut) return;
 
+      // Only consume the key when there's a dice to roll (i.e. the dice
+      // haven't been rolled yet for this turn AND it's the human's turn).
+      const gs = onlineGameState ?? gameState;
+      if (!gs) return;
+      if (gs.winner) return;
+      if (gs.diceRolled || isRolling) return;
+      if (gs.isTransitioning) return;
+      if (onlineGameState && myColor !== getCurrentPlayer(gs)) return;
+      if (!onlineGameState && !isHumanTurn(gs)) return;
+
       event.preventDefault();
       if (onlineGameState) {
         onlineRollDice();
-        return;
+      } else {
+        rollDice();
       }
-      rollDice();
     };
 
     window.addEventListener('keydown', onRollShortcut);
     return () => window.removeEventListener('keydown', onRollShortcut);
-  }, [screen, adminPortalOpen, onlineGameState, onlineRollDice, rollDice]);
+  }, [screen, adminPortalOpen, onlineGameState, gameState, isRolling, myColor, onlineRollDice, rollDice]);
 
   const onlineSelectDice = useCallback((index: number) => {
     if (!socket || !roomInfo) return;
@@ -1321,15 +1468,15 @@ export default function App() {
   }
 
   if (screen === 'online-login') {
-    return <>{adminPortal}<OnlineLoginScreen onConnect={(sock, uname, savedGames) => {
-      setSocket(sock); setOnlineUsername(uname); setOnlineSavedGames(savedGames); setScreen('online-lobby');
+    return <>{adminPortal}<OnlineLoginScreen onConnect={(sock, uname, savedGames, posStats) => {
+      setSocket(sock); setOnlineUsername(uname); setOnlineSavedGames(savedGames); setPositionStats(posStats || emptyPositionStats()); setScreen('online-lobby');
     }} /></>;
   }
 
   if (screen === 'online-lobby') {
-    return <>{adminPortal}<OnlineLobbyScreen socket={socket!} username={onlineUsername} onlineUsers={onlineUsers} roomInfo={roomInfo} invites={invites} savedGames={onlineSavedGames}
+    return <>{adminPortal}<OnlineLobbyScreen socket={socket!} username={onlineUsername} onlineUsers={onlineUsers} roomInfo={roomInfo} invites={invites} savedGames={onlineSavedGames} positionStats={positionStats}
       onResumeGame={resumeOnlineGame}
-      onBack={() => { socket?.disconnect(); setSocket(null); setRoomInfo(null); setInvites([]); setOnlineUsers([]); setOnlineSavedGames([]); setScreen('start'); }} />;
+      onBack={() => { socket?.disconnect(); setSocket(null); setRoomInfo(null); setInvites([]); setOnlineUsers([]); setOnlineSavedGames([]); setPositionStats(null); setScreen('start'); }} />;
     </>;
   }
 

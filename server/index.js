@@ -91,6 +91,50 @@ function getValidMovesForAnyDice(tokens, player, pendingDice, captureCounts = cr
   return result;
 }
 
+// ─── Mandatory capture helpers (server-side) ───────────────────────────────
+
+function moveWouldCapture(tokens, token, diceValue) {
+  if (token.steps === -1) return false;
+  const newSteps = token.steps + diceValue;
+  if (newSteps < 0 || newSteps > 50) return false;
+  const pathIndex = (START_INDICES[token.player] + newSteps) % 52;
+  if (isSafePosition(pathIndex)) return false;
+  return tokens.some(
+    ot => ot.player !== token.player && ot.steps >= 0 && ot.steps <= 50 &&
+      (START_INDICES[ot.player] + ot.steps) % 52 === pathIndex
+  );
+}
+
+function hasCaptureAvailable(tokens, player, diceValue, captureCounts = createEmptyCaptureCounts()) {
+  const moves = getValidMoves(tokens, player, diceValue, captureCounts);
+  return moves.some(t => moveWouldCapture(tokens, t, diceValue));
+}
+
+function getCapturableTokenIds(tokens, player, chosenToken, diceValue) {
+  const ids = new Set();
+  for (const t of tokens) {
+    if (t.player !== player) continue;
+    if (t.id === chosenToken.id) continue;
+    if (t.steps === -1 || t.steps >= 56) continue;
+    if (moveWouldCapture(tokens, t, diceValue)) {
+      ids.add(t.id);
+    }
+  }
+  return ids;
+}
+
+function applyMandatoryCapturePenalty(tokensToUpdate, player, chosenToken, capturableIds) {
+  const newTokens = tokensToUpdate.map(t => {
+    if (t.player !== player) return t;
+    if (t.id === chosenToken.id) return t;
+    if (capturableIds.has(t.id) && t.steps !== -1) {
+      return { ...t, steps: -1 };
+    }
+    return t;
+  });
+  return { tokens: newTokens };
+}
+
 function executeMove(tokens, token, diceValue, captureCounts) {
   const newTokens = tokens.map(t => ({ ...t }));
   const newCaptureCounts = { ...captureCounts };
@@ -126,6 +170,30 @@ function executeMove(tokens, token, diceValue, captureCounts) {
 
 function checkWin(tokens, player) {
   return tokens.filter(t => t.player === player).every(t => t.steps >= 56);
+}
+
+function hasPlayerFinished(tokens, player) {
+  return tokens.filter(t => t.player === player).every(t => t.steps >= 56);
+}
+
+function registerFinishedPlayer(finishedOrder, player, tokens) {
+  if (finishedOrder.includes(player)) return finishedOrder;
+  if (!hasPlayerFinished(tokens, player)) return finishedOrder;
+  return [...finishedOrder, player];
+}
+
+function emptyPositionStats() {
+  return { first: 0, second: 0, third: 0, fourth: 0, gamesPlayed: 0 };
+}
+
+function bumpPositionStat(account, place) {
+  if (!account) return;
+  if (!account.positionStats) account.positionStats = emptyPositionStats();
+  account.positionStats.gamesPlayed = (account.positionStats.gamesPlayed || 0) + 1;
+  if (place === 1) account.positionStats.first += 1;
+  else if (place === 2) account.positionStats.second += 1;
+  else if (place === 3) account.positionStats.third += 1;
+  else if (place === 4) account.positionStats.fourth += 1;
 }
 
 function shouldGetExtraTurnFromDice(options, diceValues) {
@@ -169,6 +237,7 @@ function createInitialState(players, options, gameId = crypto.randomUUID()) {
     consecutiveSixes: 0,
     rollHasSix: false,
     captureCounts: createEmptyCaptureCounts(),
+    finishedOrder: [],
   };
 }
 
@@ -178,6 +247,7 @@ function normalizeGameState(state) {
     ...state,
     gameId: state.gameId || crypto.randomUUID(),
     captureCounts: state.captureCounts || createEmptyCaptureCounts(),
+    finishedOrder: Array.isArray(state.finishedOrder) ? state.finishedOrder.slice() : [],
     turnSnapshot: Array.isArray(state.turnSnapshot) ? state.turnSnapshot.map(t => ({ ...t })) : state.tokens.map(t => ({ ...t })),
   };
 }
@@ -336,7 +406,13 @@ function notifySavedGamesForRoom(room) {
 function notifySavedGamesForAllUsers() {
   for (const [, user] of users) {
     const sid = findSocketByUsername(user.username);
-    if (sid) io.to(sid).emit('saved-games-updated', { savedGames: listSavedGamesForUser(user.username) });
+    if (sid) {
+      io.to(sid).emit('saved-games-updated', { savedGames: listSavedGamesForUser(user.username) });
+      const account = persistentData.accounts[user.username];
+      if (account) {
+        io.to(sid).emit('position-stats', { positionStats: account.positionStats || emptyPositionStats() });
+      }
+    }
   }
 }
 
@@ -580,8 +656,29 @@ function processMove(room, token) {
   if (!getValidMoves(state.tokens, cp, diceValue, state.captureCounts)
     .some(t => t.id === token.id && t.player === token.player)) return;
 
-  const { tokens: newTokens, captured, enteredBoard, captureCounts } = executeMove(state.tokens, token, diceValue, state.captureCounts);
-  const winner = checkWin(newTokens, cp) ? cp : null;
+  const { tokens: movedTokens, captured, enteredBoard, captureCounts } = executeMove(state.tokens, token, diceValue, state.captureCounts);
+
+  // ─── Mandatory capture penalty (server) ────────────────────────────────
+  let newTokens = movedTokens;
+  let newCaptureCounts = captureCounts;
+  let penaltyMessage = '';
+  if (!captured && hasCaptureAvailable(state.tokens, cp, diceValue, state.captureCounts)) {
+    const capturableIds = getCapturableTokenIds(state.tokens, cp, token, diceValue);
+    if (capturableIds.size > 0) {
+      const penalty = applyMandatoryCapturePenalty(movedTokens, cp, token, capturableIds);
+      newTokens = penalty.tokens;
+      penaltyMessage = ' ⚠️ Missed a capture — your capturable pieces were sent home!';
+    }
+  }
+
+  // ─── Ranking & game-end logic ─────────────────────────────────────────
+  const playerFinished = hasPlayerFinished(newTokens, cp);
+  const finishedOrder = playerFinished
+    ? registerFinishedPlayer(state.finishedOrder, cp, newTokens)
+    : state.finishedOrder;
+  const shouldEndGame = finishedOrder.length >= 3 && state.players.length >= 3;
+  const winner = shouldEndGame ? (finishedOrder[0] || null) : null;
+
   const extraFromDice = state.earnedExtraTurn;
   const extraFromCapture = captured && state.options.extraTurnOnCapture;
   const extraFromEntry = enteredBoard && state.options.extraRollOnEntry;
@@ -594,26 +691,75 @@ function processMove(room, token) {
   if (isChooseMode && !state.rollHasSix && newPendingDice.length > 0) newPendingDice.length = 0;
 
   if (newPendingDice.length > 0) {
-    if (getValidMovesForAnyDice(newTokens, cp, newPendingDice, captureCounts).length === 0) newPendingDice.length = 0;
+    if (getValidMovesForAnyDice(newTokens, cp, newPendingDice, newCaptureCounts).length === 0) newPendingDice.length = 0;
   }
 
   state.tokens = newTokens;
-  state.captureCounts = captureCounts;
+  state.captureCounts = newCaptureCounts;
+  state.finishedOrder = finishedOrder;
 
   if (newPendingDice.length === 0) {
     if (winner) {
+      // Build final ranking: finishedOrder (1st, 2nd, 3rd) + remaining player (4th).
+      const remaining = state.players.filter(p => !finishedOrder.includes(p));
+      const fourth = remaining[0] || null;
+      const ranking = [...finishedOrder.slice(0, 3), ...(fourth ? [fourth] : [])];
+      const rankingText = ranking.map((p, i) => `${i + 1}. ${capitalize(p)}`).join(' • ');
       Object.assign(state, {
         pendingDice: [],
         selectedDiceIndex: null,
         diceRolled: false,
         diceValues: [],
         winner,
-        message: `🎉 ${capitalize(winner)} wins the game! 🎉`,
+        message: `🏆 Game over! ${rankingText}`,
       });
+      // Update position stats for every participating account.
+      for (let i = 0; i < ranking.length; i++) {
+        const place = i + 1;
+        const colorForPlace = ranking[i];
+        // Find the username whose color matches.
+        let username = null;
+        for (const [uname, col] of Object.entries(room.playerColors || {})) {
+          if (col === colorForPlace) { username = uname; break; }
+        }
+        if (username && persistentData.accounts[username]) {
+          bumpPositionStat(persistentData.accounts[username], place);
+        }
+      }
+      persistData();
       deleteSavedGame(state.gameId);
       saveGameRecord(room);
       emitRoomState(room);
       emitGameState(room);
+      // Notify each user that their stats changed.
+      notifySavedGamesForAllUsers();
+      return;
+    }
+    if (playerFinished && !shouldEndGame) {
+      const place = finishedOrder.length;
+      const suffix = place === 1 ? '1st' : place === 2 ? '2nd' : '3rd';
+      let npi = (state.currentPlayerIndex + 1) % state.players.length;
+      // Skip already-finished players.
+      let safety = state.players.length;
+      while (safety-- > 0 && finishedOrder.includes(state.players[npi])) {
+        const next = (npi + 1) % state.players.length;
+        if (next === npi) break;
+        npi = next;
+      }
+      const nextPlayer = state.players[npi];
+      Object.assign(state, {
+        pendingDice: [],
+        selectedDiceIndex: null,
+        diceValues: [],
+        diceRolled: false,
+        currentPlayerIndex: npi,
+        earnedExtraTurn: false,
+        consecutiveSixes: 0,
+        rollHasSix: false,
+        turnSnapshot: state.tokens.map(t => ({ ...t })),
+        message: `🎉 ${capitalize(cp)} finished in ${suffix} place! ${capitalize(nextPlayer)}'s turn - Roll the dice!`,
+      });
+      saveGameRecord(room);
       return;
     }
     if (anyExtraTurn) {
@@ -632,7 +778,12 @@ function processMove(room, token) {
       saveGameRecord(room);
       return;
     }
-    const npi = (state.currentPlayerIndex + 1) % state.players.length;
+    // Find next non-finished player
+    let npi = (state.currentPlayerIndex + 1) % state.players.length;
+    let safety = state.players.length;
+    while (safety-- > 0 && finishedOrder.includes(state.players[npi])) {
+      npi = (npi + 1) % state.players.length;
+    }
     Object.assign(state, {
       pendingDice: [],
       selectedDiceIndex: null,
@@ -650,9 +801,9 @@ function processMove(room, token) {
       pendingDice: newPendingDice,
       selectedDiceIndex: newPendingDice.length === 1 ? 0 : null,
       earnedExtraTurn: anyExtraTurn,
-      message: newPendingDice.length === 1
+      message: (newPendingDice.length === 1
         ? `Tap a token to move ${newPendingDice[0]} steps.`
-        : 'Select a die, then tap a token.',
+        : 'Select a die, then tap a token.') + penaltyMessage,
     });
   }
 
@@ -687,11 +838,12 @@ io.on('connection', (socket) => {
       passwordHash: hashPassword(pass),
       createdAt: Date.now(),
       lastLogin: Date.now(),
+      positionStats: emptyPositionStats(),
     };
     persistData();
 
     users.set(socket.id, { username: uname, roomId: null, account: uname });
-    socket.emit('login-success', { username: uname, savedGames: listSavedGamesForUser(uname) });
+    socket.emit('login-success', { username: uname, savedGames: listSavedGamesForUser(uname), positionStats: persistentData.accounts[uname].positionStats });
     broadcastOnlineUsers();
     console.log(`Account created: ${uname}`);
   });
@@ -756,7 +908,7 @@ io.on('connection', (socket) => {
     }
 
     users.set(socket.id, { username: uname, roomId: null, account: account ? uname : null });
-    socket.emit('login-success', { username: uname, savedGames: listSavedGamesForUser(uname) });
+    socket.emit('login-success', { username: uname, savedGames: listSavedGamesForUser(uname), positionStats: account ? (account.positionStats || emptyPositionStats()) : null });
     broadcastOnlineUsers();
     console.log(`User logged in: ${uname}`);
   });
@@ -902,6 +1054,9 @@ io.on('connection', (socket) => {
     saveGameRecord(room);
     io.to(room.id).emit('game-resumed', { roomId: room.id, gameState: room.gameState, room: getRoomInfo(room) });
     broadcastOnlineUsers();
+    // Re-send the user's own position stats so the lobby stays in sync.
+    const account = persistentData.accounts[user.username];
+    if (account) socket.emit('position-stats', { positionStats: account.positionStats || emptyPositionStats() });
   });
 
   socket.on('roll-dice', ({ roomId }) => {
