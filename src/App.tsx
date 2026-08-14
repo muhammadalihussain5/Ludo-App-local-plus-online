@@ -7,7 +7,7 @@ import {
   createInitialState, createEmptyCaptureCounts, getCurrentPlayer, isHumanTurn, capitalize,
   shouldReverseTurn, shouldGetExtraTurnFromDice, rollHasSix, isDoubleSix,
   getAIMove, getAIMoveTwoDice,
-  hasCaptureAvailable, applyMandatoryCapturePenalty, getCapturableTokenIds, moveWouldCapture,
+  getCapturableOpponentTokens, applyMissedCaptureRemoval, formatMissedCaptureMessage, moveWouldCapture,
   registerFinishedPlayer, hasPlayerFinished,
 } from './gameLogic';
 
@@ -93,12 +93,20 @@ function createBlankCaptureCounts(): Record<PlayerColor, number> {
 }
 
 function normalizeGameState(state: GameState): GameState {
-  return {
+  const raw = state as GameState & { earnedExtraTurn?: boolean };
+  const normalized: GameState = {
     ...state,
     gameId: state.gameId || (globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`),
     captureCounts: state.captureCounts || createBlankCaptureCounts(),
     finishedOrder: state.finishedOrder || [],
+    // Migrate saves that predate the rename: earnedExtraTurn meant "must roll
+    // again before moving" under the old flow, which maps to pendingExtraRoll.
+    pendingExtraRoll: typeof state.pendingExtraRoll === 'boolean' ? state.pendingExtraRoll : !!raw.earnedExtraTurn,
+    pendingBonusReason: typeof state.pendingBonusReason === 'string' ? state.pendingBonusReason : '',
+    missedCaptureTargets: Array.isArray(state.missedCaptureTargets) ? [...state.missedCaptureTargets] : [],
   };
+  delete (normalized as GameState & { earnedExtraTurn?: boolean }).earnedExtraTurn;
+  return normalized;
 }
 
 function buildSavedGameTitle(state: GameState): string {
@@ -1070,7 +1078,7 @@ function GameBoard({ gameState, boardSize, myColor, isOnline, isRolling, onToken
               <div className="flex flex-col items-center gap-1">
                 <button onClick={onRollDice} disabled={gameState.diceRolled || isRolling}
                   className={`px-6 py-2.5 rounded-xl font-bold text-sm shadow-lg transition-all ${gameState.diceRolled || isRolling ? 'bg-gray-600 text-gray-400 cursor-not-allowed' : 'bg-gradient-to-r from-yellow-400 to-orange-500 text-white hover:scale-105 active:scale-95'}`}>
-                  {isRolling ? 'Rolling...' : gameState.diceRolled ? 'Tap a Token' : 'Roll Dice 🎲'}
+                  {isRolling ? 'Rolling...' : gameState.diceRolled ? 'Tap a Token' : gameState.pendingExtraRoll ? 'Roll again 🎲' : 'Roll Dice 🎲'}
                 </button>
                 <p className="text-[11px] text-white/50">Shortcut: R or Space</p>
               </div>
@@ -1264,7 +1272,7 @@ export default function App() {
     const finished = prev.finishedOrder || [];
     let npi = overrideIndex !== undefined ? overrideIndex : (prev.currentPlayerIndex + 1) % prev.players.length;
     if (prev.winner) {
-      return { ...prev, diceRolled: false, diceValues: [], pendingDice: [], selectedDiceIndex: null, earnedExtraTurn: false, consecutiveSixes: 0, rollHasSix: false, isTransitioning: false };
+      return { ...prev, diceRolled: false, diceValues: [], pendingDice: [], selectedDiceIndex: null, pendingExtraRoll: false, pendingBonusReason: '', missedCaptureTargets: [], consecutiveSixes: 0, rollHasSix: false, isTransitioning: false };
     }
     if (finished.length > 0) {
       let safety = prev.players.length;
@@ -1273,11 +1281,11 @@ export default function App() {
       }
     }
     const np = prev.players[npi];
-    return { ...prev, diceRolled: false, diceValues: [], pendingDice: [], selectedDiceIndex: null, currentPlayerIndex: npi, earnedExtraTurn: false, consecutiveSixes: 0, rollHasSix: false, message: `${capitalize(np)}'s turn - Roll the dice!`, isTransitioning: !prev.options.isAIMode && prev.players.length > 1, turnSnapshot: prev.tokens.map(t => ({ ...t })) };
+    return { ...prev, diceRolled: false, diceValues: [], pendingDice: [], selectedDiceIndex: null, currentPlayerIndex: npi, pendingExtraRoll: false, pendingBonusReason: '', missedCaptureTargets: [], consecutiveSixes: 0, rollHasSix: false, message: `${capitalize(np)}'s turn - Roll the dice!`, isTransitioning: !prev.options.isAIMode && prev.players.length > 1, turnSnapshot: prev.tokens.map(t => ({ ...t })) };
   }, []);
 
   const startExtraTurn = useCallback((prev: GameState, reason: string): GameState => {
-    return { ...prev, diceRolled: false, diceValues: [], pendingDice: [], selectedDiceIndex: null, earnedExtraTurn: false, message: `${capitalize(getCurrentPlayer(prev))} gets another turn! (${reason})` };
+    return { ...prev, diceRolled: false, diceValues: [], pendingDice: [], selectedDiceIndex: null, pendingExtraRoll: false, pendingBonusReason: '', missedCaptureTargets: [], message: `${capitalize(getCurrentPlayer(prev))} gets another turn! (${reason})` };
   }, []);
 
   const rollDice = useCallback(() => {
@@ -1291,7 +1299,7 @@ export default function App() {
       const elapsed = Date.now() - startTime;
       if (elapsed < rollDuration) {
         const tempValues = Array.from({ length: diceCount }, () => Math.floor(Math.random() * 6) + 1);
-        setGameState(prev => prev ? { ...prev, diceValues: tempValues } : null);
+        setGameState(prev => prev ? { ...prev, diceValues: [...prev.pendingDice, ...tempValues] } : null);
         requestAnimationFrame(animateRoll);
       } else {
         const finalValues = Array.from({ length: diceCount }, () => Math.floor(Math.random() * 6) + 1);
@@ -1307,15 +1315,39 @@ export default function App() {
             const restored = prev.turnSnapshot.map(t => ({ ...t }));
             return { ...transitionToNextPlayer({ ...prev, tokens: restored, consecutiveSixes: 0 }), message: prev.options.diceCount === 1 ? `⚠️ 3 consecutive 6s! ${capitalize(player)}'s turn is reversed!` : `⚠️ 2 consecutive double 6s! ${capitalize(player)}'s turn is reversed!` };
           }
-          const pendingDice = prev.options.diceCount === 1 ? [finalValues[0]] : [...finalValues];
-          const anyValid = getValidMovesForAnyDice(prev.tokens, player, pendingDice, prev.captureCounts);
-          const hasValidMoves = anyValid.length > 0;
+
+          // Accumulate this roll's dice onto the pool from earlier bonus rolls.
+          const newPendingDice = [...prev.pendingDice, ...finalValues];
+          const newDiceValues = [...prev.pendingDice, ...finalValues];
+
+          // If this roll earns another roll, keep rolling BEFORE moving.
           const extraFromDice = shouldGetExtraTurnFromDice(prev.options, finalValues);
+          if (extraFromDice) {
+            return {
+              ...prev,
+              diceValues: newDiceValues,
+              pendingDice: newPendingDice,
+              selectedDiceIndex: null,
+              diceRolled: false,
+              pendingExtraRoll: true,
+              consecutiveSixes: newConsecutiveSixes,
+              rollHasSix: hasSix,
+              message: prev.options.diceCount === 1
+                ? `${capitalize(player)} rolled a 6! Roll again!`
+                : `${capitalize(player)} rolled double 6! Roll again!`,
+            };
+          }
+
+          // No more bonus rolls: the player moves with the full accumulated pool.
+          const anyValid = getValidMovesForAnyDice(prev.tokens, player, newPendingDice, prev.captureCounts);
+          const hasValidMoves = anyValid.length > 0;
+          const captureTargets = getCapturableOpponentTokens(prev.tokens, player, newPendingDice, prev.options)
+            .map(t => `${t.player}-${t.id}`);
           let message = prev.options.diceCount === 1 ? `${capitalize(player)} rolled a ${finalValues[0]}!` : `${capitalize(player)} rolled ${finalValues[0]} & ${finalValues[1]}!`;
           if (!hasValidMoves) message += ' No valid moves.';
-          else if (pendingDice.length === 1) message += ' Tap a token to move.';
+          else if (newPendingDice.length === 1) message += ' Tap a token to move.';
           else message += ' Select a die, then tap a token.';
-          return { ...prev, diceValues: finalValues, pendingDice, selectedDiceIndex: pendingDice.length === 1 ? 0 : null, diceRolled: true, earnedExtraTurn: extraFromDice, consecutiveSixes: newConsecutiveSixes, rollHasSix: hasSix, message };
+          return { ...prev, diceValues: newDiceValues, pendingDice: newPendingDice, selectedDiceIndex: newPendingDice.length === 1 ? 0 : null, diceRolled: true, pendingExtraRoll: false, consecutiveSixes: newConsecutiveSixes, rollHasSix: hasSix, missedCaptureTargets: captureTargets, message };
         });
         setIsRolling(false); rollingRef.current = false;
       }
@@ -1353,24 +1385,8 @@ export default function App() {
       if (!getValidMoves(prev.tokens, cp, diceValue, prev.captureCounts).some(t => t.id === token.id && t.player === token.player)) return prev;
       const { tokens: movedTokens, captured, enteredBoard, captureCounts } = executeMove(prev.tokens, token, diceValue, prev.captureCounts);
 
-      // ─── Mandatory capture penalty ───────────────────────────────────────
-      // If a capture was available with this dice value but the player did
-      // NOT take it, send home any of their other pieces that COULD have
-      // captured. The piece they actually moved stays where it is.
-      // We compute the set of capturable token IDs from the ORIGINAL state,
-      // then apply the penalty on top of `movedTokens` so the player's move
-      // is preserved while missed-capture pieces are sent home.
-      let newTokens = movedTokens;
-      let newCaptureCounts = captureCounts;
-      let penaltyMessage = '';
-      if (!captured && hasCaptureAvailable(prev.tokens, cp, diceValue, prev.captureCounts)) {
-        const capturableIds = getCapturableTokenIds(prev.tokens, cp, token, diceValue);
-        if (capturableIds.size > 0) {
-          const penalty = applyMandatoryCapturePenalty(movedTokens, cp, token, capturableIds);
-          newTokens = penalty.tokens;
-          penaltyMessage = ' ⚠️ Missed a capture — your capturable pieces were sent home!';
-        }
-      }
+      const newTokens = movedTokens;
+      const newCaptureCounts = captureCounts;
 
       // ─── Ranking & game-end logic ───────────────────────────────────────
       // The current player may have just finished. If so, add them to the
@@ -1383,47 +1399,63 @@ export default function App() {
       const shouldEndGame = finishedOrder.length >= prev.players.length - 1;
       const winner = shouldEndGame ? (finishedOrder[0] ?? null) : null;
 
-      const extraFromDice = prev.earnedExtraTurn;
-      const extraFromCapture = captured && prev.options.extraTurnOnCapture;
-      const extraFromEntry = enteredBoard && prev.options.extraRollOnEntry;
-      const anyExtraTurn = extraFromDice || extraFromCapture || extraFromEntry;
+      // Capture/entry bonuses happen AFTER a move, so they can't be pre-rolled.
+      // Track the reason so it survives a multi-dice move phase.
+      let pendingBonusReason = prev.pendingBonusReason;
+      if (captured && prev.options.extraTurnOnCapture) pendingBonusReason = 'captured';
+      else if (enteredBoard && prev.options.extraRollOnEntry) pendingBonusReason = 'entered board';
+
       const newPendingDice = [...prev.pendingDice]; newPendingDice.splice(diceIndex, 1);
       const isChooseMode = prev.options.diceCount === 2 && prev.options.twoDiceMode === 'choose';
       if (isChooseMode && !prev.rollHasSix && newPendingDice.length > 0) newPendingDice.length = 0;
       if (newPendingDice.length > 0 && getValidMovesForAnyDice(newTokens, cp, newPendingDice, newCaptureCounts).length === 0) newPendingDice.length = 0;
       const updated = { ...prev, tokens: newTokens, captureCounts: newCaptureCounts, finishedOrder };
       if (newPendingDice.length === 0) {
+        // ─── Missed-capture removal ───────────────────────────────────────
+        // A capture is no longer forced, but any opponent piece that was
+        // capturable when the move phase began and is still on the board is
+        // sent home now that the player has finished moving.
+        const removal = applyMissedCaptureRemoval(newTokens, cp, prev.missedCaptureTargets, newCaptureCounts);
+        const finalTokens = removal.tokens;
+        const finalCaptureCounts = removal.captureCounts;
+        const missedMessage = formatMissedCaptureMessage(removal.removedColors);
+        const finalUpdated = { ...updated, tokens: finalTokens, captureCounts: finalCaptureCounts, missedCaptureTargets: [] };
+
         if (winner) {
           // Final ranking: everyone who finished (1st, 2nd, …) followed by
           // whoever is left over (the last place).
           const remaining = prev.players.filter(p => !finishedOrder.includes(p));
           const ranking = [...finishedOrder, ...remaining];
           const rankingText = ranking.map((p, i) => `${i + 1}. ${capitalize(p)}`).join(' • ');
-          return { ...updated, pendingDice: [], selectedDiceIndex: null, diceRolled: false, diceValues: [], winner, message: `🏆 Game over! ${rankingText}` };
+          return { ...finalUpdated, pendingDice: [], selectedDiceIndex: null, diceRolled: false, diceValues: [], winner, message: `🏆 Game over! ${rankingText}` };
         }
         if (playerFinished && !shouldEndGame) {
           // Mark the player's finish in the message and let the game continue
           // for the remaining players.
           const place = finishedOrder.length; // 1, 2, ...
           const suffix = ['1st', '2nd', '3rd', '4th'][place - 1] ?? `${place}th`;
-          // End the current player's turn so the next player rolls.
-          const nextState = transitionToNextPlayer({ ...updated, pendingDice: [], selectedDiceIndex: null, diceValues: [], diceRolled: false });
-          return { ...nextState, message: `🎉 ${capitalize(cp)} finished in ${suffix} place! ${nextState.message}` };
+          const nextState = transitionToNextPlayer({ ...finalUpdated, pendingDice: [], selectedDiceIndex: null, diceValues: [], diceRolled: false });
+          return { ...nextState, message: `🎉 ${capitalize(cp)} finished in ${suffix} place! ${nextState.message}${missedMessage ? ' ' + missedMessage : ''}` };
         }
-        if (anyExtraTurn) { const reasons: string[] = []; if (extraFromDice) reasons.push(prev.options.diceCount === 1 ? 'rolled 6' : 'double 6'); if (extraFromCapture) reasons.push('captured'); if (extraFromEntry) reasons.push('entered board'); return startExtraTurn({ ...updated, pendingDice: [], selectedDiceIndex: null, diceValues: [], diceRolled: false }, reasons.join(' & ')); }
-        return transitionToNextPlayer({ ...updated, pendingDice: [], selectedDiceIndex: null, diceValues: [], diceRolled: false });
+        if (pendingBonusReason) {
+          const bonusState = startExtraTurn({ ...finalUpdated, pendingDice: [], selectedDiceIndex: null, diceValues: [], diceRolled: false, pendingBonusReason: '' }, pendingBonusReason);
+          return { ...bonusState, message: bonusState.message + (missedMessage ? ' ' + missedMessage : '') };
+        }
+        const nextState = transitionToNextPlayer({ ...finalUpdated, pendingDice: [], selectedDiceIndex: null, diceValues: [], diceRolled: false });
+        return { ...nextState, message: nextState.message + (missedMessage ? ' ' + missedMessage : '') };
       }
-      return { ...updated, pendingDice: newPendingDice, selectedDiceIndex: newPendingDice.length === 1 ? 0 : null, earnedExtraTurn: anyExtraTurn, message: (newPendingDice.length === 1 ? `Tap a token to move ${newPendingDice[0]} steps.` : 'Select a die, then tap a token.') + penaltyMessage };
+      return { ...updated, pendingDice: newPendingDice, selectedDiceIndex: newPendingDice.length === 1 ? 0 : null, pendingBonusReason, message: (newPendingDice.length === 1 ? `Tap a token to move ${newPendingDice[0]} steps.` : 'Select a die, then tap a token.') };
     });
   }, [transitionToNextPlayer, startExtraTurn]);
 
   const handleNoMoves = useCallback(() => {
     setGameState(prev => {
       if (!prev) return prev;
-      if (prev.earnedExtraTurn) return startExtraTurn({ ...prev, diceRolled: false, diceValues: [], pendingDice: [], selectedDiceIndex: null, earnedExtraTurn: false }, prev.options.diceCount === 1 ? 'rolled 6' : 'double 6');
+      // Dice-based bonuses are pre-rolled now, so "no valid moves" simply
+      // ends the turn and passes play to the next player.
       return transitionToNextPlayer(prev);
     });
-  }, [transitionToNextPlayer, startExtraTurn]);
+  }, [transitionToNextPlayer]);
 
   const handleReady = useCallback(() => { setGameState(prev => prev ? { ...prev, isTransitioning: false } : prev); }, []);
 

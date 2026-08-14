@@ -30,7 +30,15 @@ export interface GameState {
   gameStarted: boolean;
   message: string;
   options: GameOptions;
-  earnedExtraTurn: boolean;
+  // True when the current player still owes themselves another roll before
+  // moving (rolled a 6 with one die, or double 6 with two dice). The bonus
+  // dice are accumulated first, then the player moves with the whole pool.
+  pendingExtraRoll: boolean;
+  // Non-empty when a post-move bonus was earned during the move phase (a
+  // capture with extraTurnOnCapture, or a board entry with extraRollOnEntry).
+  // Holds the human-readable reason and is granted once the pending dice are
+  // exhausted.
+  pendingBonusReason: string;
   isTransitioning: boolean;
   // Turn snapshot for reversal
   turnSnapshot: Token[];
@@ -39,6 +47,10 @@ export interface GameState {
   // Whether the current roll had a 6 (for "choose" mode override)
   rollHasSix: boolean;
   captureCounts: Record<PlayerColor, number>;
+  // Opponent token keys (`${player}-${id}`) that were capturable when the move
+  // phase began. Any of these still on the board when the player finishes
+  // moving are sent home (missed-capture removal).
+  missedCaptureTargets: string[];
 }
 
 export const PLAYER_COLORS: Record<PlayerColor, { bg: string; light: string; dark: string; text: string; border: string }> = {
@@ -166,18 +178,12 @@ export function getValidMoves(
   diceValue: number,
   captureCounts: Record<PlayerColor, number> = createEmptyCaptureCounts(),
 ): Token[] {
-  const valid = tokens.filter(t => t.player === player).filter(token => {
+  return tokens.filter(t => t.player === player).filter(token => {
     if (token.steps === -1) return diceValue === 6;
     if (token.steps >= 56) return false;
     if (token.steps < 51 && token.steps + diceValue > 50 && captureCounts[player] <= 0) return false;
     return token.steps + diceValue <= 56;
   });
-  // ─── Mandatory capture ────────────────────────────────────────────────
-  // If any valid move with this die would capture an opponent, then only
-  // the capturing moves are legal. This forces the player (and the AI) to
-  // take a capture whenever one is available.
-  const captures = valid.filter(token => moveWouldCapture(tokens, token, diceValue));
-  return captures.length > 0 ? captures : valid;
 }
 
 export function getValidMovesForAnyDice(
@@ -188,23 +194,12 @@ export function getValidMovesForAnyDice(
 ): Token[] {
   const seen = new Set<string>();
   const result: Token[] = [];
-  const captureSeen = new Set<string>();
-  const captures: Token[] = [];
   for (const dv of pendingDice) {
     for (const t of getValidMoves(tokens, player, dv, captureCounts)) {
       const key = `${t.player}-${t.id}`;
       if (!seen.has(key)) { seen.add(key); result.push(t); }
-      // Track moves that capture with this particular die value.
-      if (moveWouldCapture(tokens, t, dv) && !captureSeen.has(key)) {
-        captureSeen.add(key);
-        captures.push(t);
-      }
     }
   }
-  // ─── Mandatory capture ────────────────────────────────────────────────
-  // If any die offers a capture, then only capturing moves are legal for
-  // the whole turn (regardless of which die the player had in mind).
-  if (captures.length > 0) return captures;
   return result;
 }
 
@@ -265,79 +260,104 @@ export function moveWouldCapture(tokens: Token[], token: Token, diceValue: numbe
   );
 }
 
-// Returns the subset of `moves` that, with the given dice value, would capture.
-export function getCaptureAvailableTokens(
-  tokens: Token[],
-  moves: Token[],
-  diceValue: number,
-): Token[] {
-  return moves.filter(t => moveWouldCapture(tokens, t, diceValue));
+// ─── Missed-capture (mandatory capture) helpers ─────────────────────────────
+//
+// A capture is no longer forced on the player: every legal move is allowed.
+// Instead, if a capture was possible during the turn and the player did not
+// take it, the OPPONENT piece that could have been captured is removed from
+// the board anyway. Detection must cover:
+//   1. each individual die value,
+//   2. the sum of the dice (two-dice "both" mode: one piece moving d1 + d2),
+//   3. any combination/sequence of the dice applied to the same piece
+//      (e.g. move d1 then d2 — the final square is the same as moving d1+d2),
+// including the larger accumulated pools produced by bonus re-rolls.
+
+// Enumerate every distinct total a piece can reach by using any non-empty
+// subset of `pendingDice`. Since applying dice in any order produces the same
+// final total, subset sums cover all combinations/sequences. In two-dice
+// "choose" mode the player only ever uses one die of the pair (the other is
+// discarded), so only the individual die values are reachable there.
+export function getReachableTotals(pendingDice: number[], options?: GameOptions): number[] {
+  if (options && options.diceCount === 2 && options.twoDiceMode === 'choose') {
+    return [...new Set(pendingDice)];
+  }
+  const counts = new Map<number, number>();
+  for (const dv of pendingDice) counts.set(dv, (counts.get(dv) ?? 0) + 1);
+  const unique = [...counts.keys()];
+  const totals = new Set<number>();
+  const rec = (i: number, sum: number) => {
+    if (i === unique.length) {
+      if (sum > 0) totals.add(sum);
+      return;
+    }
+    const value = unique[i];
+    const max = counts.get(value)!;
+    for (let k = 0; k <= max; k++) rec(i + 1, sum + value * k);
+  };
+  rec(0, 0);
+  return [...totals].sort((a, b) => a - b);
 }
 
-// True if any of the player's currently valid moves (for the given dice value)
-// would capture an opponent.
-export function hasCaptureAvailable(
-  tokens: Token[],
-  player: PlayerColor,
-  diceValue: number,
-  captureCounts: Record<PlayerColor, number>,
-): boolean {
-  const moves = getValidMoves(tokens, player, diceValue, captureCounts);
-  return getCaptureAvailableTokens(tokens, moves, diceValue).length > 0;
-}
-
-// True if any of the player's valid moves across any pending die would capture.
-export function hasCaptureAvailableForAnyDice(
+// Returns the opponent tokens that `player` could capture this turn using any
+// reachable total from `pendingDice`. Each entry is the actual opponent token
+// object (still on the board). Safe landing squares never count, and a piece
+// still in its home base (steps === -1) cannot capture by moving out — both
+// rules are enforced by `moveWouldCapture`.
+export function getCapturableOpponentTokens(
   tokens: Token[],
   player: PlayerColor,
   pendingDice: number[],
-  captureCounts: Record<PlayerColor, number>,
-): boolean {
-  for (const dv of pendingDice) {
-    if (hasCaptureAvailable(tokens, player, dv, captureCounts)) return true;
-  }
-  return false;
-}
-
-// Returns the set of `player`'s token IDs that, with `diceValue`, could have
-// captured an opponent piece (i.e. moved onto an opponent on a non-safe
-// square) in the given tokens layout, EXCLUDING `chosenToken.id`.
-export function getCapturableTokenIds(
-  tokens: Token[],
-  player: PlayerColor,
-  chosenToken: Token,
-  diceValue: number,
-): Set<number> {
-  const ids = new Set<number>();
+  options?: GameOptions,
+): Token[] {
+  const totals = getReachableTotals(pendingDice, options);
+  const capturable = new Map<string, Token>();
   for (const t of tokens) {
-    if (t.player !== player) continue;
-    if (t.id === chosenToken.id) continue;
-    if (t.steps === -1 || t.steps >= 56) continue;
-    if (moveWouldCapture(tokens, t, diceValue)) {
-      ids.add(t.id);
+    if (t.player !== player || t.steps === -1 || t.steps >= 56) continue;
+    for (const total of totals) {
+      if (!moveWouldCapture(tokens, t, total)) continue;
+      const newSteps = t.steps + total;
+      if (newSteps < 0 || newSteps > 50) continue;
+      const pathIndex = (START_INDICES[t.player] + newSteps) % 52;
+      for (const ot of tokens) {
+        if (ot.player === player || ot.steps < 0 || ot.steps > 50) continue;
+        if ((START_INDICES[ot.player] + ot.steps) % 52 === pathIndex) {
+          capturable.set(`${ot.player}-${ot.id}`, ot);
+        }
+      }
     }
   }
-  return ids;
+  return [...capturable.values()];
 }
 
-// Apply the mandatory-capture penalty: send home any of `player`'s tokens
-// (in `tokensToUpdate`) whose IDs are in `capturableIds`, EXCEPT for the
-// chosen token. The captureCounts are passed through unchanged.
-export function applyMandatoryCapturePenalty(
-  tokensToUpdate: Token[],
+// Send home every capturable opponent token (identified by its key in
+// `targetKeys`) that is still on the board. Each removal counts as a capture
+// for the moving player (so home entry unlocks), but no extra turn is granted.
+export function applyMissedCaptureRemoval(
+  tokens: Token[],
   player: PlayerColor,
-  chosenToken: Token,
-  capturableIds: Set<number>,
-): { tokens: Token[] } {
-  const newTokens = tokensToUpdate.map(t => {
-    if (t.player !== player) return t;
-    if (t.id === chosenToken.id) return t;
-    if (capturableIds.has(t.id) && t.steps !== -1) {
+  targetKeys: string[],
+  captureCounts: Record<PlayerColor, number>,
+): { tokens: Token[]; removedColors: PlayerColor[]; captureCounts: Record<PlayerColor, number> } {
+  const keys = new Set(targetKeys);
+  const removedColors: PlayerColor[] = [];
+  const newCaptureCounts = { ...captureCounts };
+  const newTokens = tokens.map(t => {
+    if (keys.has(`${t.player}-${t.id}`) && t.steps !== -1) {
+      removedColors.push(t.player);
+      newCaptureCounts[player] += 1;
       return { ...t, steps: -1 };
     }
     return t;
   });
-  return { tokens: newTokens };
+  return { tokens: newTokens, removedColors, captureCounts: newCaptureCounts };
+}
+
+// Human-readable message for the missed-capture removal.
+export function formatMissedCaptureMessage(removedColors: PlayerColor[]): string {
+  if (removedColors.length === 0) return '';
+  const names = removedColors.map(c => `${capitalize(c)}'s`).join(' and ');
+  const noun = removedColors.length > 1 ? 'pieces were' : 'piece was';
+  return `⚠️ Missed capture — ${names} ${noun} sent home!`;
 }
 
 export function checkWin(tokens: Token[], player: PlayerColor): boolean {
@@ -405,21 +425,8 @@ export function getAIMove(
   const validMoves = getValidMoves(tokens, player, diceValue, captureCounts);
   if (validMoves.length === 0) return null;
 
-  // Priority 1: Capture
-  const captureToken = validMoves.find(t => {
-    if (t.steps === -1) {
-      const startIdx = START_INDICES[player];
-      if (isSafePosition(startIdx)) return false;
-      return tokens.some(ot => ot.player !== player && ot.steps >= 0 && ot.steps <= 50 &&
-        (START_INDICES[ot.player] + ot.steps) % 52 === startIdx);
-    }
-    const newSteps = t.steps + diceValue;
-    if (newSteps > 50) return false;
-    const pathIndex = (START_INDICES[t.player] + newSteps) % 52;
-    if (isSafePosition(pathIndex)) return false;
-    return tokens.some(ot => ot.player !== player && ot.steps >= 0 && ot.steps <= 50 &&
-      (START_INDICES[ot.player] + ot.steps) % 52 === pathIndex);
-  });
+  // Priority 1: Capture (the AI still prefers taking a real capture).
+  const captureToken = validMoves.find(t => moveWouldCapture(tokens, t, diceValue));
   if (captureToken) return captureToken;
 
   // Priority 2: Enter home stretch or finish
@@ -457,23 +464,12 @@ export function getAIMoveTwoDice(
 
     let priority = 0;
     if (move.steps === -1) {
-      const startIdx = START_INDICES[player];
-      if (!isSafePosition(startIdx) && tokens.some(ot =>
-        ot.player !== player && ot.steps >= 0 && ot.steps <= 50 &&
-        (START_INDICES[ot.player] + ot.steps) % 52 === startIdx
-      )) priority = 3;
-      else priority = 1;
+      priority = 1; // moving out of the home base
     } else {
       const newSteps = move.steps + dv;
-      if (newSteps >= 51) priority = 4;
-      else if (newSteps <= 50) {
-        const pathIndex = (START_INDICES[move.player] + newSteps) % 52;
-        if (!isSafePosition(pathIndex) && tokens.some(ot =>
-          ot.player !== player && ot.steps >= 0 && ot.steps <= 50 &&
-          (START_INDICES[ot.player] + ot.steps) % 52 === pathIndex
-        )) priority = 3;
-        else priority = 2;
-      }
+      if (newSteps >= 51) priority = 4; // enter home stretch / finish
+      else if (moveWouldCapture(tokens, move, dv)) priority = 3; // capture
+      else priority = 2; // plain move
     }
 
     if (!bestMove || priority > bestMove.priority) {
@@ -503,12 +499,14 @@ export function createInitialState(players: PlayerColor[], options: GameOptions)
     gameStarted: true,
     message: `${capitalize(players[0])}'s turn - Roll the dice!`,
     options,
-    earnedExtraTurn: false,
+    pendingExtraRoll: false,
+    pendingBonusReason: '',
     isTransitioning: !options.isAIMode && players.length > 1,
     turnSnapshot: tokens.map(t => ({ ...t })),
     consecutiveSixes: 0,
     rollHasSix: false,
     captureCounts: createEmptyCaptureCounts(),
+    missedCaptureTargets: [],
     finishedOrder: [],
   };
 }
