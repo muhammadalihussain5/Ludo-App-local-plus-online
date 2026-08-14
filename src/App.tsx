@@ -7,7 +7,7 @@ import {
   createInitialState, createEmptyCaptureCounts, getCurrentPlayer, isHumanTurn, capitalize,
   shouldReverseTurn, shouldGetExtraTurnFromDice, rollHasSix, isDoubleSix,
   getAIMove, getAIMoveTwoDice,
-  hasCaptureAvailable, applyMandatoryCapturePenalty, getCapturableTokenIds,
+  hasCaptureAvailable, applyMandatoryCapturePenalty, getCapturableTokenIds, moveWouldCapture,
   registerFinishedPlayer, hasPlayerFinished,
 } from './gameLogic';
 
@@ -367,9 +367,12 @@ function OnlineLoginScreen({ onConnect }: { onConnect: (socket: Socket, username
       onConnect(socket, data.username, data.savedGames || [], data.positionStats ?? null);
     });
 
-    socket.on('login-error', (data: { message: string }) => {
+    socket.on('login-error', (data: { message: string; accountNotFound?: boolean }) => {
       setConnecting(false);
       setError(data.message);
+      // If the server says the account doesn't exist, help the player by
+      // switching them to the "Create Account" form.
+      if (data.accountNotFound) setMode('create');
       socket.disconnect();
     });
 
@@ -491,6 +494,42 @@ function OnlineLobbyScreen({ socket, username, onlineUsers, roomInfo, invites, s
           <div className="text-white font-bold">🌐 {username}</div>
         </div>
 
+        {/* Player Position Stats — always shown so players can see their record */}
+        {(() => {
+          const stats = positionStats ?? emptyPositionStats();
+          return (
+            <div className="bg-gradient-to-br from-amber-500/15 to-yellow-500/10 border border-amber-500/30 rounded-2xl p-4 mb-4">
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-amber-300 font-semibold text-sm">🏆 Position Record</h3>
+                <span className="text-amber-200/60 text-xs">{stats.gamesPlayed || 0} games</span>
+              </div>
+              <div className="grid grid-cols-4 gap-2">
+                <div className="flex flex-col items-center justify-center rounded-xl bg-yellow-500/20 border border-yellow-500/40 p-2">
+                  <span className="text-lg">🥇</span>
+                  <span className="text-yellow-200 text-xs font-medium">1st</span>
+                  <span className="text-white text-lg font-bold leading-none mt-0.5">{stats.first}</span>
+                </div>
+                <div className="flex flex-col items-center justify-center rounded-xl bg-slate-300/20 border border-slate-300/40 p-2">
+                  <span className="text-lg">🥈</span>
+                  <span className="text-slate-200 text-xs font-medium">2nd</span>
+                  <span className="text-white text-lg font-bold leading-none mt-0.5">{stats.second}</span>
+                </div>
+                <div className="flex flex-col items-center justify-center rounded-xl bg-orange-700/20 border border-orange-600/40 p-2">
+                  <span className="text-lg">🥉</span>
+                  <span className="text-orange-200 text-xs font-medium">3rd</span>
+                  <span className="text-white text-lg font-bold leading-none mt-0.5">{stats.third}</span>
+                </div>
+                <div className="flex flex-col items-center justify-center rounded-xl bg-white/5 border border-white/15 p-2">
+                  <span className="text-lg">4️⃣</span>
+                  <span className="text-white/70 text-xs font-medium">4th</span>
+                  <span className="text-white text-lg font-bold leading-none mt-0.5">{stats.fourth}</span>
+                </div>
+              </div>
+              <p className="text-amber-200/50 text-[11px] mt-2 text-center">Game ends when the second-last player finishes, so all players are ranked.</p>
+            </div>
+          );
+        })()}
+
         {/* Invites */}
         {invites.length > 0 && (
           <div className="bg-amber-500/20 border border-amber-500/40 rounded-2xl p-4 mb-4">
@@ -594,39 +633,6 @@ function OnlineLobbyScreen({ socket, username, onlineUsers, roomInfo, invites, s
                 </button>
               ))}
             </div>
-          </div>
-        )}
-
-        {/* Player Stats — only shown when not in a room and the user has stats */}
-        {!roomInfo && positionStats && (positionStats.gamesPlayed || 0) > 0 && (
-          <div className="bg-gradient-to-br from-amber-500/15 to-yellow-500/10 border border-amber-500/30 rounded-2xl p-4 mb-4">
-            <div className="flex items-center justify-between mb-3">
-              <h3 className="text-amber-300 font-semibold text-sm">🏆 Your Game History</h3>
-              <span className="text-amber-200/60 text-xs">{positionStats.gamesPlayed} games</span>
-            </div>
-            <div className="grid grid-cols-4 gap-2">
-              <div className="flex flex-col items-center justify-center rounded-xl bg-yellow-500/20 border border-yellow-500/40 p-2">
-                <span className="text-lg">🥇</span>
-                <span className="text-yellow-200 text-xs font-medium">1st</span>
-                <span className="text-white text-lg font-bold leading-none mt-0.5">{positionStats.first}</span>
-              </div>
-              <div className="flex flex-col items-center justify-center rounded-xl bg-slate-300/20 border border-slate-300/40 p-2">
-                <span className="text-lg">🥈</span>
-                <span className="text-slate-200 text-xs font-medium">2nd</span>
-                <span className="text-white text-lg font-bold leading-none mt-0.5">{positionStats.second}</span>
-              </div>
-              <div className="flex flex-col items-center justify-center rounded-xl bg-orange-700/20 border border-orange-600/40 p-2">
-                <span className="text-lg">🥉</span>
-                <span className="text-orange-200 text-xs font-medium">3rd</span>
-                <span className="text-white text-lg font-bold leading-none mt-0.5">{positionStats.third}</span>
-              </div>
-              <div className="flex flex-col items-center justify-center rounded-xl bg-white/5 border border-white/15 p-2">
-                <span className="text-lg">4️⃣</span>
-                <span className="text-white/70 text-xs font-medium">4th</span>
-                <span className="text-white text-lg font-bold leading-none mt-0.5">{positionStats.fourth}</span>
-              </div>
-            </div>
-            <p className="text-amber-200/50 text-[11px] mt-2 text-center">Game ends when the 3rd player finishes, so all players are ranked.</p>
           </div>
         )}
 
@@ -880,7 +886,7 @@ function ScoreBoard({ state, myColor }: { state: GameState; myColor?: PlayerColo
         const isCurrent = getCurrentPlayer(state) === player;
         const isMe = myColor === player;
         const placeIdx = finishedOrder.indexOf(player);
-        const placeLabel = placeIdx >= 0 ? `${placeIdx + 1}st` : '';
+        const placeLabel = placeIdx >= 0 ? (['1st', '2nd', '3rd', '4th'][placeIdx] ?? '') : '';
         return (
           <div key={player} className={`flex items-center gap-1.5 px-2.5 py-1 rounded-xl border-2 transition-all duration-300 ${isCurrent ? 'scale-110 shadow-lg' : 'opacity-60'}`}
             style={{ backgroundColor: colors.light, borderColor: isCurrent ? colors.dark : colors.border }}>
@@ -899,11 +905,11 @@ function ScoreBoard({ state, myColor }: { state: GameState; myColor?: PlayerColo
 
 // ─── Game Board Component ────────────────────────────────────────────────────
 
-function GameBoard({ gameState, boardSize, myColor, isOnline, isRolling, onTokenClick, onRollDice, onSelectDice, onNewGame }: {
+function GameBoard({ gameState, boardSize, myColor, isOnline, isRolling, onTokenClick, onRollDice, onSelectDice, onNewGame, onPlayAgain }: {
   gameState: GameState; boardSize: number; myColor?: PlayerColor | null;
   isOnline: boolean; isRolling: boolean;
   onTokenClick: (token: Token) => void; onRollDice: () => void;
-  onSelectDice: (index: number) => void; onNewGame: () => void;
+  onSelectDice: (index: number) => void; onNewGame: () => void; onPlayAgain: () => void;
 }) {
   const currentPlayer = getCurrentPlayer(gameState);
   const isMyTurn = isOnline ? myColor === currentPlayer : isHumanTurn(gameState);
@@ -1010,8 +1016,7 @@ function GameBoard({ gameState, boardSize, myColor, isOnline, isRolling, onToken
         {gameState.winner && (() => {
           const finishedOrder = gameState.finishedOrder || [];
           const remaining = gameState.players.filter(p => !finishedOrder.includes(p));
-          const fourth = remaining[0] ?? null;
-          const ranking = [...finishedOrder.slice(0, 3), ...(fourth ? [fourth] : [])];
+          const ranking = [...finishedOrder, ...remaining];
           const placeLabels = ['1st', '2nd', '3rd', '4th'];
           const placeEmojis = ['🥇', '🥈', '🥉', '4️⃣'];
           return (
@@ -1026,7 +1031,12 @@ function GameBoard({ gameState, boardSize, myColor, isOnline, isRolling, onToken
                   </div>
                 ))}
               </div>
-              <div className="mt-3"><button onClick={onNewGame} className="px-6 py-2 bg-white/20 text-white rounded-xl font-medium hover:bg-white/30 transition-colors">Play Again</button></div>
+              <div className="mt-3 flex items-center justify-center gap-3">
+                {!isOnline && (
+                  <button onClick={onPlayAgain} className="px-6 py-2 bg-white/20 text-white rounded-xl font-medium hover:bg-white/30 transition-colors">🔁 Play Again</button>
+                )}
+                <button onClick={onNewGame} className="px-6 py-2 bg-gradient-to-r from-blue-500 to-indigo-600 text-white rounded-xl font-bold hover:scale-105 transition-transform active:scale-95">🏠 Home</button>
+              </div>
             </div>
           );
         })()}
@@ -1250,7 +1260,22 @@ export default function App() {
       if (token.player !== cp) return prev;
       let diceValue: number, diceIndex: number;
       if (prev.selectedDiceIndex !== null) { diceIndex = prev.selectedDiceIndex; diceValue = prev.pendingDice[diceIndex]; }
-      else { const idx = prev.pendingDice.findIndex(dv => getValidMoves(prev.tokens, cp, dv, prev.captureCounts).some(t => t.id === token.id && t.player === token.player)); if (idx === -1) return prev; diceIndex = idx; diceValue = prev.pendingDice[idx]; }
+      else {
+        // With several dice, prefer the die that makes this move a capture so
+        // the mandatory-capture rule is honored; otherwise use the first die
+        // that makes the token a valid move.
+        let idx = -1;
+        for (let i = 0; i < prev.pendingDice.length; i++) {
+          const dv = prev.pendingDice[i];
+          const isValid = getValidMoves(prev.tokens, cp, dv, prev.captureCounts).some(t => t.id === token.id && t.player === token.player);
+          if (!isValid) continue;
+          if (moveWouldCapture(prev.tokens, token, dv)) { idx = i; break; }
+          if (idx === -1) idx = i;
+        }
+        if (idx === -1) return prev;
+        diceIndex = idx;
+        diceValue = prev.pendingDice[idx];
+      }
       if (!getValidMoves(prev.tokens, cp, diceValue, prev.captureCounts).some(t => t.id === token.id && t.player === token.player)) return prev;
       const { tokens: movedTokens, captured, enteredBoard, captureCounts } = executeMove(prev.tokens, token, diceValue, prev.captureCounts);
 
@@ -1275,12 +1300,13 @@ export default function App() {
 
       // ─── Ranking & game-end logic ───────────────────────────────────────
       // The current player may have just finished. If so, add them to the
-      // finishedOrder. The game ends when 3 players have finished.
+      // finishedOrder. The game ends as soon as the second-last player
+      // finishes (i.e. only one player is left unranked).
       const playerFinished = hasPlayerFinished(newTokens, cp);
       const finishedOrder = playerFinished
         ? registerFinishedPlayer(prev.finishedOrder, cp, newTokens)
         : prev.finishedOrder;
-      const shouldEndGame = finishedOrder.length >= 3 && prev.players.length >= 3;
+      const shouldEndGame = finishedOrder.length >= prev.players.length - 1;
       const winner = shouldEndGame ? (finishedOrder[0] ?? null) : null;
 
       const extraFromDice = prev.earnedExtraTurn;
@@ -1294,19 +1320,18 @@ export default function App() {
       const updated = { ...prev, tokens: newTokens, captureCounts: newCaptureCounts, finishedOrder };
       if (newPendingDice.length === 0) {
         if (winner) {
-          // Final ranking: 1st, 2nd, 3rd from finishedOrder, 4th is whoever
-          // remains in `prev.players` but not in finishedOrder.
+          // Final ranking: everyone who finished (1st, 2nd, …) followed by
+          // whoever is left over (the last place).
           const remaining = prev.players.filter(p => !finishedOrder.includes(p));
-          const fourth = remaining[0] ?? null;
-          const ranking = [...finishedOrder.slice(0, 3), ...(fourth ? [fourth] : [])];
+          const ranking = [...finishedOrder, ...remaining];
           const rankingText = ranking.map((p, i) => `${i + 1}. ${capitalize(p)}`).join(' • ');
           return { ...updated, pendingDice: [], selectedDiceIndex: null, diceRolled: false, diceValues: [], winner, message: `🏆 Game over! ${rankingText}` };
         }
         if (playerFinished && !shouldEndGame) {
           // Mark the player's finish in the message and let the game continue
           // for the remaining players.
-          const place = finishedOrder.length; // 1, 2, or 3
-          const suffix = place === 1 ? '1st' : place === 2 ? '2nd' : '3rd';
+          const place = finishedOrder.length; // 1, 2, ...
+          const suffix = ['1st', '2nd', '3rd', '4th'][place - 1] ?? `${place}th`;
           // End the current player's turn so the next player rolls.
           const nextState = transitionToNextPlayer({ ...updated, pendingDice: [], selectedDiceIndex: null, diceValues: [], diceRolled: false });
           return { ...nextState, message: `🎉 ${capitalize(cp)} finished in ${suffix} place! ${nextState.message}` };
@@ -1540,6 +1565,11 @@ export default function App() {
       onTokenClick={isOnline ? onlineMoveToken : handleTokenClick}
       onRollDice={isOnline ? onlineRollDice : rollDice}
       onSelectDice={isOnline ? onlineSelectDice : handleSelectDice}
+      onPlayAgain={() => {
+        if (isOnline) return;
+        const current = gameState;
+        if (current) setGameState(createInitialState(current.players, current.options));
+      }}
       onNewGame={() => {
         if (isOnline) { socket?.disconnect(); setSocket(null); setOnlineGameState(null); setRoomInfo(null); setMyColor(null); setInvites([]); }
         else { setGameState(null); }

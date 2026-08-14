@@ -23,7 +23,7 @@ export interface GameState {
   pendingDice: number[];
   selectedDiceIndex: number | null;
   diceRolled: boolean;
-  // Winner is set only when the game actually ends (3rd player finishes)
+  // Winner is set only when the game actually ends (the second-last player finishes)
   winner: PlayerColor | null;
   // Order in which players finished (1st, 2nd, 3rd). The 4th place is whoever is left.
   finishedOrder: PlayerColor[];
@@ -166,12 +166,18 @@ export function getValidMoves(
   diceValue: number,
   captureCounts: Record<PlayerColor, number> = createEmptyCaptureCounts(),
 ): Token[] {
-  return tokens.filter(t => t.player === player).filter(token => {
+  const valid = tokens.filter(t => t.player === player).filter(token => {
     if (token.steps === -1) return diceValue === 6;
     if (token.steps >= 56) return false;
     if (token.steps < 51 && token.steps + diceValue > 50 && captureCounts[player] <= 0) return false;
     return token.steps + diceValue <= 56;
   });
+  // ─── Mandatory capture ────────────────────────────────────────────────
+  // If any valid move with this die would capture an opponent, then only
+  // the capturing moves are legal. This forces the player (and the AI) to
+  // take a capture whenever one is available.
+  const captures = valid.filter(token => moveWouldCapture(tokens, token, diceValue));
+  return captures.length > 0 ? captures : valid;
 }
 
 export function getValidMovesForAnyDice(
@@ -182,12 +188,23 @@ export function getValidMovesForAnyDice(
 ): Token[] {
   const seen = new Set<string>();
   const result: Token[] = [];
+  const captureSeen = new Set<string>();
+  const captures: Token[] = [];
   for (const dv of pendingDice) {
     for (const t of getValidMoves(tokens, player, dv, captureCounts)) {
       const key = `${t.player}-${t.id}`;
       if (!seen.has(key)) { seen.add(key); result.push(t); }
+      // Track moves that capture with this particular die value.
+      if (moveWouldCapture(tokens, t, dv) && !captureSeen.has(key)) {
+        captureSeen.add(key);
+        captures.push(t);
+      }
     }
   }
+  // ─── Mandatory capture ────────────────────────────────────────────────
+  // If any die offers a capture, then only capturing moves are legal for
+  // the whole turn (regardless of which die the player had in mind).
+  if (captures.length > 0) return captures;
   return result;
 }
 
@@ -234,7 +251,7 @@ export function executeMove(tokens: Token[], token: Token, diceValue: number, ca
 // Returns true if moving `token` by `diceValue` would land on an opponent's
 // piece (i.e. result in a capture) AND that landing square is not a safe
 // square.
-function moveWouldCapture(tokens: Token[], token: Token, diceValue: number): boolean {
+export function moveWouldCapture(tokens: Token[], token: Token, diceValue: number): boolean {
   // Coming out of home base (-1) goes to start square; that's its own "entry" rule,
   // not a capture.
   if (token.steps === -1) return false;
@@ -328,7 +345,7 @@ export function checkWin(tokens: Token[], player: PlayerColor): boolean {
 }
 
 // True if `player` has all four pieces home (steps >= 56). Used for
-// ranking — the game ends when the 3rd player finishes, not the 1st.
+// ranking — the game ends when the second-last player finishes, not the 1st.
 export function hasPlayerFinished(tokens: Token[], player: PlayerColor): boolean {
   return tokens.filter(t => t.player === player).every(t => t.steps >= 56);
 }
