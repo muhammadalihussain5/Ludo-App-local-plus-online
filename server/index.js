@@ -502,7 +502,53 @@ function getRoomInfo(room) {
     paused: !!room.paused,
     gameId: room.gameState ? room.gameState.gameId : null,
     vacantSlots: room.vacantSlots || [],
+    pendingReplacements: room.pendingReplacements || {},
   };
+}
+
+// ─── Replacement take-over helpers ─────────────────────────────────────────
+// When players leave mid-game their colour becomes a "vacant slot". The host
+// invites a replacement and explicitly chooses WHICH vacant position (colour)
+// that replacement takes over, so the game can resume instead of getting stuck.
+
+function getVacantColors(room) {
+  return (room.vacantSlots || []).map(slot => slot.color);
+}
+
+// Colours that are still free to hand out: vacant slots that have not already
+// been promised to another invited replacement.
+function getAssignableColors(room, forUsername) {
+  const promised = new Set(
+    Object.entries(room.pendingReplacements || {})
+      .filter(([uname]) => uname !== forUsername)
+      .map(([, color]) => color)
+  );
+  return getVacantColors(room).filter(color => !promised.has(color));
+}
+
+// Resolve the colour an invited replacement should take over. Honours the
+// host's explicit choice when it is still available, otherwise falls back to
+// the first assignable vacant position.
+function resolveTakeOverColor(room, username, requestedColor) {
+  const assignable = getAssignableColors(room, username);
+  if (assignable.length === 0) return null;
+  if (requestedColor && assignable.includes(requestedColor)) return requestedColor;
+  return assignable[0];
+}
+
+function clearPendingReplacement(room, username) {
+  if (!room.pendingReplacements) return;
+  delete room.pendingReplacements[username];
+}
+
+// Drop promises that no longer point at a real vacancy (e.g. the host chose to
+// continue without that player after inviting someone).
+function prunePendingReplacements(room) {
+  if (!room.pendingReplacements) { room.pendingReplacements = {}; return; }
+  const vacant = new Set(getVacantColors(room));
+  for (const [uname, color] of Object.entries(room.pendingReplacements)) {
+    if (!vacant.has(color)) delete room.pendingReplacements[uname];
+  }
 }
 
 function findSocketByUsername(username) {
@@ -534,6 +580,7 @@ function hydrateRoomFromSavedGame(savedGame) {
     started: true,
     paused: !!savedGame.paused,
     vacantSlots: savedGame.vacantSlots || [],
+    pendingReplacements: {},
   };
   rooms.set(room.id, room);
   return room;
@@ -555,6 +602,7 @@ function startGameForRoom(room) {
   room.started = true;
   room.paused = false;
   room.vacantSlots = [];
+  room.pendingReplacements = {};
   saveGameRecord(room);
   emitRoomState(room);
   emitGameState(room);
@@ -968,6 +1016,7 @@ io.on('connection', (socket) => {
       started: false,
       paused: false,
       vacantSlots: [],
+      pendingReplacements: {},
     });
     user.roomId = roomId;
     socket.join(roomId);
@@ -976,32 +1025,72 @@ io.on('connection', (socket) => {
     console.log(`Room created: ${roomId} by ${user.username}`);
   });
 
-  socket.on('invite-player', ({ roomId, username }) => {
+  socket.on('invite-player', ({ roomId, username, takeOverColor }) => {
     const room = rooms.get(roomId);
     if (!room) return;
     const user = users.get(socket.id);
     if (!user || room.host !== user.username) return;
     if (room.players.includes(username)) return;
+
+    // Only reserve a position for someone who is actually online, otherwise
+    // an unreachable invite would block a slot forever.
     const targetSid = findSocketByUsername(username);
-    if (targetSid) {
-      io.to(targetSid).emit('room-invite', { roomId, from: user.username, playerCount: room.playerCount });
+    if (!targetSid) {
+      return socket.emit('invite-error', { roomId, message: `${username} is not online.` });
     }
+
+    // ─── Replacement take-over ──────────────────────────────────────────
+    // For a game already in progress the host must decide which previous
+    // position (colour) the invited replacement takes over. We record that
+    // promise now so the slot is reserved and the game can resume cleanly.
+    let assignedColor = null;
+    if (room.started && getVacantColors(room).length > 0) {
+      prunePendingReplacements(room);
+      assignedColor = resolveTakeOverColor(room, username, takeOverColor);
+      if (!assignedColor) {
+        return socket.emit('invite-error', { roomId, message: 'No free position left to take over.' });
+      }
+      room.pendingReplacements = room.pendingReplacements || {};
+      room.pendingReplacements[username] = assignedColor;
+    }
+
+    io.to(targetSid).emit('room-invite', {
+      roomId,
+      from: user.username,
+      playerCount: room.playerCount,
+      takeOverColor: assignedColor,
+    });
+
+    if (assignedColor) emitRoomState(room);
   });
 
   socket.on('accept-invite', ({ roomId }) => {
     const room = rooms.get(roomId);
-    if (!room || room.players.length >= room.playerCount) return;
+    if (!room) return;
     const user = users.get(socket.id);
     if (!user || room.players.includes(user.username)) return;
 
+    const isReplacement = room.started && getVacantColors(room).length > 0;
+    if (!isReplacement && room.players.length >= room.playerCount) return;
+
     let color = null;
-    const vacantIndex = room.vacantSlots.findIndex(slot => !slot.username || slot.username === user.username);
-    if (vacantIndex !== -1) {
-      color = room.vacantSlots[vacantIndex].color;
-      room.vacantSlots.splice(vacantIndex, 1);
+    if (isReplacement) {
+      // Take over the exact position the host picked for this player.
+      prunePendingReplacements(room);
+      const promised = (room.pendingReplacements || {})[user.username];
+      color = resolveTakeOverColor(room, user.username, promised);
+      if (!color) return;
+      clearPendingReplacement(room, user.username);
+      room.vacantSlots = room.vacantSlots.filter(slot => slot.color !== color);
     } else {
-      const colors = ['green', 'yellow', 'red', 'blue'];
-      color = colors[room.players.length];
+      const vacantIndex = room.vacantSlots.findIndex(slot => !slot.username || slot.username === user.username);
+      if (vacantIndex !== -1) {
+        color = room.vacantSlots[vacantIndex].color;
+        room.vacantSlots.splice(vacantIndex, 1);
+      } else {
+        const colors = ['green', 'yellow', 'red', 'blue'];
+        color = colors[room.players.length];
+      }
     }
 
     room.players.push(user.username);
@@ -1009,13 +1098,20 @@ io.on('connection', (socket) => {
     room.playerColors[user.username] = color;
     user.roomId = roomId;
     socket.join(roomId);
+    prunePendingReplacements(room);
     if (room.vacantSlots.length === 0) room.paused = false;
 
+    // The replacement plays the colour they took over, so tell them about it.
+    if (room.started) socket.emit('your-color', { color });
+
     emitRoomState(room);
-    if (!room.paused) io.to(room.id).emit('game-resumed', { roomId: room.id, gameState: room.gameState, room: getRoomInfo(room) });
+    if (room.started && !room.paused) {
+      emitGameState(room);
+      io.to(room.id).emit('game-resumed', { roomId: room.id, gameState: sanitizeGameState(room.gameState), room: getRoomInfo(room) });
+    }
     saveGameRecord(room);
     broadcastOnlineUsers();
-    console.log(`${user.username} joined room ${roomId}`);
+    console.log(`${user.username} joined room ${roomId}${isReplacement ? ` as replacement for ${color}` : ''}`);
   });
 
   socket.on('reject-invite', ({ roomId }) => {
@@ -1080,10 +1176,14 @@ io.on('connection', (socket) => {
     if (!getSavedGameUsers(savedGame).includes(user.username)) return;
 
     const room = hydrateRoomFromSavedGame(savedGame);
-    const vacantSlot = room.vacantSlots.find(slot => slot.username === user.username);
+    prunePendingReplacements(room);
+    const promisedColor = (room.pendingReplacements || {})[user.username];
+    const vacantSlot = room.vacantSlots.find(slot => slot.username === user.username)
+      || (promisedColor ? room.vacantSlots.find(slot => slot.color === promisedColor) : null);
     if (vacantSlot) {
       room.playerColors[user.username] = vacantSlot.color;
-      room.vacantSlots = room.vacantSlots.filter(slot => slot.username !== user.username);
+      room.vacantSlots = room.vacantSlots.filter(slot => slot.color !== vacantSlot.color);
+      clearPendingReplacement(room, user.username);
     }
     attachUserToRoom(room, user.username, socket, room.playerColors[user.username]);
     room.paused = room.vacantSlots.length > 0;
@@ -1156,17 +1256,20 @@ io.on('connection', (socket) => {
     const user = users.get(socket.id);
     if (!user || room.host !== user.username) return;
 
-    const vacancy = room.vacantSlots.find(slot => slot.username === playerName) || room.vacantSlots[0];
+    const vacancy = room.vacantSlots.find(slot => slot.username === playerName)
+      || room.vacantSlots.find(slot => slot.color === playerName)
+      || room.vacantSlots[0];
     if (!vacancy) return;
     const color = vacancy.color;
 
-    room.vacantSlots = room.vacantSlots.filter(slot => slot.username !== vacancy.username);
+    room.vacantSlots = room.vacantSlots.filter(slot => slot.color !== color);
+    prunePendingReplacements(room);
     room.participants = Array.from(new Set([...(room.participants || []), ...room.players, room.host].filter(Boolean)));
     room.players = room.players.filter(p => p !== vacancy.username);
     delete room.playerColors[vacancy.username];
     delete room.playerSockets[vacancy.username];
     room.gameState = removeColorFromGameState(normalizeGameState(room.gameState), color);
-    room.paused = false;
+    room.paused = room.vacantSlots.length > 0;
     room.started = true;
     ensureRoomHost(room);
 
@@ -1189,6 +1292,7 @@ io.on('connection', (socket) => {
           if (color) {
             room.paused = true;
             room.vacantSlots = [...(room.vacantSlots || []), { username: user.username, color }];
+            clearPendingReplacement(room, user.username);
           }
           room.participants = Array.from(new Set([...(room.participants || []), room.host, ...room.players, user.username].filter(Boolean)));
           room.players = room.players.filter(p => p !== user.username);

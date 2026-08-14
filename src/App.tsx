@@ -38,9 +38,10 @@ interface RoomInfo {
   paused?: boolean;
   gameId?: string;
   vacantSlots?: { username: string; color: PlayerColor }[];
+  pendingReplacements?: Record<string, PlayerColor>;
 }
 
-interface InviteInfo { roomId: string; from: string; playerCount: number; }
+interface InviteInfo { roomId: string; from: string; playerCount: number; takeOverColor?: PlayerColor | null; }
 
 interface PositionStats {
   first: number;
@@ -351,6 +352,13 @@ function OnlineLoginScreen({ onConnect }: { onConnect: (socket: Socket, username
   const [error, setError] = useState('');
   const [connecting, setConnecting] = useState(false);
 
+  // Submitting through a real <form> lets the browser's password manager
+  // detect the login and offer to save / autofill the credentials.
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    handleConnect();
+  };
+
   const handleConnect = () => {
     if (!username.trim() || username.trim().length < 2) { setError('Username must be at least 2 characters'); return; }
     if (mode === 'create' && password.length < 4) { setError('Password must be at least 4 characters'); return; }
@@ -398,43 +406,49 @@ function OnlineLoginScreen({ onConnect }: { onConnect: (socket: Socket, username
         <p className="text-blue-200">Connect to a Ludo server</p>
       </div>
       <div className="bg-white/10 backdrop-blur-lg rounded-3xl p-6 shadow-2xl border border-white/20 max-w-sm w-full">
-        <div className="space-y-4">
+        {/* A real form (with autocomplete attributes) so the browser password
+            manager offers to save and autofill these credentials. Pressing
+            Enter in any field submits it. */}
+        <form onSubmit={handleSubmit} method="post" action="#" className="space-y-4">
           <div className="grid grid-cols-2 gap-2 p-1 bg-white/10 rounded-xl">
-            <button onClick={() => setMode('login')} className={`py-2 rounded-lg text-sm font-medium ${mode === 'login' ? 'bg-blue-500 text-white' : 'text-white/60'}`}>Login</button>
-            <button onClick={() => setMode('create')} className={`py-2 rounded-lg text-sm font-medium ${mode === 'create' ? 'bg-green-500 text-white' : 'text-white/60'}`}>Create Account</button>
+            <button type="button" onClick={() => setMode('login')} className={`py-2 rounded-lg text-sm font-medium ${mode === 'login' ? 'bg-blue-500 text-white' : 'text-white/60'}`}>Login</button>
+            <button type="button" onClick={() => setMode('create')} className={`py-2 rounded-lg text-sm font-medium ${mode === 'create' ? 'bg-green-500 text-white' : 'text-white/60'}`}>Create Account</button>
           </div>
           <div>
-            <label className="text-white/70 text-sm mb-1 block">Server URL</label>
-            <input type="text" value={serverUrl} onChange={e => setServerUrl(e.target.value)}
+            <label htmlFor="ludo-server-url" className="text-white/70 text-sm mb-1 block">Server URL</label>
+            <input id="ludo-server-url" name="serverUrl" type="text" autoComplete="url" value={serverUrl} onChange={e => setServerUrl(e.target.value)}
               className="w-full px-4 py-3 rounded-xl bg-white/10 border border-white/20 text-white placeholder-white/30 focus:outline-none focus:border-blue-400"
               placeholder="http://localhost:3001" />
           </div>
           <div>
-            <label className="text-white/70 text-sm mb-1 block">Your Username</label>
-            <input type="text" value={username} onChange={e => setUsername(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleConnect()}
+            <label htmlFor="ludo-username" className="text-white/70 text-sm mb-1 block">Your Username</label>
+            <input id="ludo-username" name="username" type="text" autoComplete="username" value={username} onChange={e => setUsername(e.target.value)}
               className="w-full px-4 py-3 rounded-xl bg-white/10 border border-white/20 text-white placeholder-white/30 focus:outline-none focus:border-blue-400"
               placeholder="Enter your name" />
           </div>
           <div>
-            <label className="text-white/70 text-sm mb-1 block">Password</label>
-            <input type="password" value={password} onChange={e => setPassword(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleConnect()}
+            <label htmlFor="ludo-password" className="text-white/70 text-sm mb-1 block">Password</label>
+            <input id="ludo-password" name="password" type="password"
+              autoComplete={mode === 'create' ? 'new-password' : 'current-password'}
+              value={password} onChange={e => setPassword(e.target.value)}
               className="w-full px-4 py-3 rounded-xl bg-white/10 border border-white/20 text-white placeholder-white/30 focus:outline-none focus:border-blue-400"
               placeholder="Enter password" />
           </div>
           {mode === 'create' && (
             <div>
-              <label className="text-white/70 text-sm mb-1 block">Confirm Password</label>
-              <input type="password" value={confirmPassword} onChange={e => setConfirmPassword(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleConnect()}
+              <label htmlFor="ludo-confirm-password" className="text-white/70 text-sm mb-1 block">Confirm Password</label>
+              <input id="ludo-confirm-password" name="confirmPassword" type="password" autoComplete="new-password"
+                value={confirmPassword} onChange={e => setConfirmPassword(e.target.value)}
                 className="w-full px-4 py-3 rounded-xl bg-white/10 border border-white/20 text-white placeholder-white/30 focus:outline-none focus:border-blue-400"
                 placeholder="Confirm password" />
             </div>
           )}
           {error && <p className="text-red-400 text-sm text-center">{error}</p>}
-          <button onClick={handleConnect} disabled={connecting}
+          <button type="submit" disabled={connecting}
             className="w-full py-3 rounded-xl bg-gradient-to-r from-blue-500 to-indigo-600 text-white font-bold shadow-lg hover:scale-105 transition-transform active:scale-95 disabled:opacity-50">
             {connecting ? 'Connecting...' : mode === 'create' ? 'Create Account & Join' : 'Connect & Login'}
           </button>
-        </div>
+        </form>
         <div className="mt-4 text-center">
           <p className="text-white/30 text-xs">For production, enter your Render backend URL, for example: https://your-app.onrender.com</p>
           <p className="text-white/30 text-xs mt-1">Local dev: <code className="bg-white/10 px-1.5 py-0.5 rounded">cd server && npm start</code></p>
@@ -454,14 +468,46 @@ function OnlineLobbyScreen({ socket, username, onlineUsers, roomInfo, invites, s
   const [playerCount, setPlayerCount] = useState(4);
   const [options, setOptions] = useState<GameOptions>({ ...DEFAULT_OPTIONS, isAIMode: false });
   const [inviteUsername, setInviteUsername] = useState('');
+  // Which previous position (colour) an invited replacement should take over.
+  const [takeOverColor, setTakeOverColor] = useState<PlayerColor | ''>('');
+  const [inviteError, setInviteError] = useState('');
+
+  useEffect(() => {
+    const onInviteError = (data: { message: string }) => setInviteError(data.message);
+    socket.on('invite-error', onInviteError);
+    return () => { socket.off('invite-error', onInviteError); };
+  }, [socket]);
+
+  // Vacant positions left behind by players who left mid-game.
+  const vacantSlots = roomInfo?.vacantSlots ?? [];
+  const pendingReplacements = roomInfo?.pendingReplacements ?? {};
+  const promisedColors = new Set(Object.values(pendingReplacements));
+  const assignableSlots = vacantSlots.filter(slot => !promisedColors.has(slot.color));
+
+  // Keep the selected take-over colour valid as slots get filled.
+  useEffect(() => {
+    if (takeOverColor && !assignableSlots.some(slot => slot.color === takeOverColor)) setTakeOverColor('');
+    if (!takeOverColor && assignableSlots.length > 0) setTakeOverColor(assignableSlots[0].color);
+  }, [roomInfo]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const createRoom = () => {
     socket.emit('create-room', { playerCount, options });
   };
 
+  const sendInvite = (username: string) => {
+    if (!username.trim() || !roomInfo) return;
+    setInviteError('');
+    // For an in-progress game the host must say which position the
+    // replacement takes over, otherwise the game cannot resume.
+    const color = assignableSlots.length > 0
+      ? (takeOverColor || assignableSlots[0].color)
+      : undefined;
+    socket.emit('invite-player', { roomId: roomInfo.id, username: username.trim(), takeOverColor: color });
+  };
+
   const invitePlayer = () => {
     if (!inviteUsername.trim() || !roomInfo) return;
-    socket.emit('invite-player', { roomId: roomInfo.id, username: inviteUsername.trim() });
+    sendInvite(inviteUsername);
     setInviteUsername('');
   };
 
@@ -569,11 +615,36 @@ function OnlineLobbyScreen({ socket, username, onlineUsers, roomInfo, invites, s
                 </div>
               ))}
             </div>
-            <div className="mt-3 flex gap-2">
-              <input type="text" value={inviteUsername} onChange={e => setInviteUsername(e.target.value)} placeholder="Enter username to invite"
+            {/* Replacement take-over: the host picks which vacated position the
+                invited player will control so the game can resume. */}
+            {isHost && assignableSlots.length > 0 && (
+              <div className="mt-3 rounded-xl border border-amber-500/40 bg-amber-500/10 p-3">
+                <p className="text-amber-300 text-xs font-semibold mb-2">Replacement takes over position</p>
+                <div className="grid grid-cols-2 gap-2">
+                  {assignableSlots.map(slot => (
+                    <button key={slot.color} type="button" onClick={() => setTakeOverColor(slot.color)}
+                      className={`flex items-center gap-2 rounded-lg px-2 py-2 text-xs font-medium transition-colors ${takeOverColor === slot.color ? 'bg-amber-500 text-white' : 'bg-white/10 text-white/70'}`}>
+                      <span className="w-3.5 h-3.5 rounded-full border" style={{ backgroundColor: PLAYER_COLORS[slot.color].bg, borderColor: PLAYER_COLORS[slot.color].dark }} />
+                      {capitalize(slot.color)} <span className="opacity-60">({slot.username})</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+            {isHost && Object.keys(pendingReplacements).length > 0 && (
+              <div className="mt-2 space-y-1">
+                {Object.entries(pendingReplacements).map(([uname, color]) => (
+                  <p key={uname} className="text-white/40 text-xs">⏳ {uname} invited to take over {capitalize(color)}</p>
+                ))}
+              </div>
+            )}
+            {/* Enter in the invite box sends the invite. */}
+            <form onSubmit={e => { e.preventDefault(); invitePlayer(); }} className="mt-3 flex gap-2">
+              <input type="text" name="inviteUsername" autoComplete="off" value={inviteUsername} onChange={e => setInviteUsername(e.target.value)} placeholder="Enter username to invite"
                 className="flex-1 px-3 py-2 rounded-lg bg-white/10 border border-white/20 text-white text-sm placeholder-white/30 focus:outline-none focus:border-blue-400" />
-              <button onClick={invitePlayer} disabled={!isHost || !inviteUsername.trim()} className="px-4 py-2 bg-blue-500 text-white text-sm rounded-lg font-medium disabled:opacity-30">Invite</button>
-            </div>
+              <button type="submit" disabled={!isHost || !inviteUsername.trim()} className="px-4 py-2 bg-blue-500 text-white text-sm rounded-lg font-medium disabled:opacity-30">Invite</button>
+            </form>
+            {inviteError && <p className="text-red-400 text-xs mt-2">{inviteError}</p>}
             {!isHost && <p className="text-white/30 text-xs mt-2">Only the host can invite and start</p>}
             {isHost && roomInfo.players.length >= roomInfo.playerCount && (
               <button onClick={startGame} className="w-full mt-3 py-3 bg-gradient-to-r from-green-500 to-emerald-600 text-white font-bold rounded-xl shadow-lg hover:scale-105 transition-transform active:scale-95">
@@ -649,8 +720,10 @@ function OnlineLobbyScreen({ socket, username, onlineUsers, roomInfo, invites, s
                     <div className="w-2 h-2 rounded-full bg-green-400" />
                     <span className="text-white text-sm">{u}</span>
                   </div>
-                  {roomInfo && isHost && !roomInfo.players.includes(u) && roomInfo.players.length < roomInfo.playerCount && (
-                    <button onClick={() => { socket.emit('invite-player', { roomId: roomInfo.id, username: u }); }} className="px-3 py-1 bg-blue-500/50 text-white text-xs rounded-lg">Invite</button>
+                  {roomInfo && isHost && !roomInfo.players.includes(u) && (roomInfo.players.length < roomInfo.playerCount || assignableSlots.length > 0) && (
+                    <button onClick={() => sendInvite(u)} className="px-3 py-1 bg-blue-500/50 text-white text-xs rounded-lg">
+                      {assignableSlots.length > 0 ? `Invite as ${capitalize(takeOverColor || assignableSlots[0].color)}` : 'Invite'}
+                    </button>
                   )}
                 </div>
               ))}
@@ -779,21 +852,22 @@ function AdminPortal({
           <div className="space-y-4">
             <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
               <h3 className="mb-3 text-sm font-semibold text-white">Admin Access</h3>
-              <div className="space-y-3">
+              {/* Real form so Enter submits and the password manager can help. */}
+              <form onSubmit={e => { e.preventDefault(); connectAdmin(); }} method="post" action="#" className="space-y-3">
                 <div>
-                  <label className="mb-1 block text-xs text-white/50">Server URL</label>
-                  <input value={serverUrl} onChange={e => setServerUrl(e.target.value)} className="w-full rounded-xl border border-white/10 bg-white/10 px-3 py-2 text-sm text-white outline-none" />
+                  <label htmlFor="ludo-admin-server-url" className="mb-1 block text-xs text-white/50">Server URL</label>
+                  <input id="ludo-admin-server-url" name="adminServerUrl" type="text" autoComplete="url" value={serverUrl} onChange={e => setServerUrl(e.target.value)} className="w-full rounded-xl border border-white/10 bg-white/10 px-3 py-2 text-sm text-white outline-none" />
                 </div>
                 <div>
-                  <label className="mb-1 block text-xs text-white/50">Admin Key</label>
-                  <input type="password" value={adminKey} onChange={e => setAdminKey(e.target.value)} className="w-full rounded-xl border border-white/10 bg-white/10 px-3 py-2 text-sm text-white outline-none" />
+                  <label htmlFor="ludo-admin-key" className="mb-1 block text-xs text-white/50">Admin Key</label>
+                  <input id="ludo-admin-key" name="adminKey" type="password" autoComplete="current-password" value={adminKey} onChange={e => setAdminKey(e.target.value)} className="w-full rounded-xl border border-white/10 bg-white/10 px-3 py-2 text-sm text-white outline-none" />
                 </div>
-                <button onClick={connectAdmin} disabled={connecting} className="w-full rounded-xl bg-indigo-500 px-3 py-2 text-sm font-semibold text-white disabled:opacity-50">
+                <button type="submit" disabled={connecting} className="w-full rounded-xl bg-indigo-500 px-3 py-2 text-sm font-semibold text-white disabled:opacity-50">
                   {connecting ? 'Connecting...' : 'Unlock Admin'}
                 </button>
                 <p className="text-xs text-amber-300/80">Shortcut: {ADMIN_SHORTCUT}</p>
                 {status && <p className="text-xs text-white/60">{status}</p>}
-              </div>
+              </form>
             </div>
 
             <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
@@ -1522,18 +1596,36 @@ export default function App() {
             <p className="text-white/60 text-sm mb-4">A player left the match. Choose how to continue.</p>
             {roomInfo.vacantSlots?.length ? (
               <div className="mb-4 space-y-2 text-left">
-                {roomInfo.vacantSlots.map(slot => (
-                  <div key={`${slot.username}-${slot.color}`} className="flex items-center justify-between rounded-xl bg-white/5 px-3 py-2">
-                    <span className="text-white text-sm">{capitalize(slot.username)} left</span>
-                    <span className="text-white/40 text-xs">{capitalize(slot.color)}</span>
-                  </div>
-                ))}
+                {roomInfo.vacantSlots.map(slot => {
+                  const invitedBy = Object.entries(roomInfo.pendingReplacements ?? {})
+                    .find(([, color]) => color === slot.color)?.[0];
+                  return (
+                    <div key={`${slot.username}-${slot.color}`} className="rounded-xl bg-white/5 px-3 py-2">
+                      <div className="flex items-center justify-between">
+                        <span className="text-white text-sm flex items-center gap-2">
+                          <span className="w-3.5 h-3.5 rounded-full border" style={{ backgroundColor: PLAYER_COLORS[slot.color].bg, borderColor: PLAYER_COLORS[slot.color].dark }} />
+                          {capitalize(slot.username)} left
+                        </span>
+                        <span className="text-white/40 text-xs">{capitalize(slot.color)}</span>
+                      </div>
+                      {invitedBy
+                        ? <p className="text-amber-300/80 text-xs mt-1">⏳ {invitedBy} invited to take over this position</p>
+                        : isHost && (
+                          <button
+                            onClick={() => socket?.emit('continue-without-player', { roomId: roomInfo.id, playerName: slot.username })}
+                            className="mt-2 w-full px-3 py-1.5 rounded-lg bg-green-500/80 text-white text-xs font-semibold">
+                            Continue without {capitalize(slot.username)}
+                          </button>
+                        )}
+                    </div>
+                  );
+                })}
               </div>
             ) : null}
             {isHost ? (
               <div className="flex flex-col gap-3">
+                <p className="text-white/50 text-xs">Invite a replacement and choose which position they take over, or drop a player to resume.</p>
                 <button onClick={() => setScreen('online-lobby')} className="px-4 py-3 rounded-xl bg-blue-500 text-white font-semibold">Invite a replacement</button>
-                <button disabled={!roomInfo.vacantSlots?.length} onClick={() => socket?.emit('continue-without-player', { roomId: roomInfo.id, playerName: roomInfo.vacantSlots?.[0]?.username })} className="px-4 py-3 rounded-xl bg-green-500 text-white font-semibold disabled:opacity-40">Continue without them</button>
               </div>
             ) : (
               <p className="text-white/50 text-sm">Waiting for the host to decide.</p>
