@@ -290,7 +290,7 @@ function removeColorFromGameState(state, color) {
 
 const DATA_FILE = path.join(__dirname, 'ludo-data.json');
 let persistentData = loadPersistentData();
-const ADMIN_SECRET = process.env.ADMIN_PORTAL_KEY || 'ludo-admin-portal-2026';
+const ADMIN_SECRET = process.env.ADMIN_PORTAL_KEY || 'admin864';
 
 function loadPersistentData() {
   try {
