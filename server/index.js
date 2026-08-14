@@ -68,17 +68,22 @@ function getCurrentPlayer(state) {
 }
 
 function getValidMoves(tokens, player, diceValue, captureCounts = createEmptyCaptureCounts()) {
-  return tokens.filter(t => t.player === player).filter(token => {
+  const valid = tokens.filter(t => t.player === player).filter(token => {
     if (token.steps === -1) return diceValue === 6;
     if (token.steps >= 56) return false;
     if (token.steps < 51 && token.steps + diceValue > 50 && captureCounts[player] <= 0) return false;
     return token.steps + diceValue <= 56;
   });
+  // Mandatory capture: if any valid move captures, only capturing moves are legal.
+  const captures = valid.filter(token => moveWouldCapture(tokens, token, diceValue));
+  return captures.length > 0 ? captures : valid;
 }
 
 function getValidMovesForAnyDice(tokens, player, pendingDice, captureCounts = createEmptyCaptureCounts()) {
   const seen = new Set();
   const result = [];
+  const captureSeen = new Set();
+  const captures = [];
   for (const dv of pendingDice) {
     for (const t of getValidMoves(tokens, player, dv, captureCounts)) {
       const key = `${t.player}-${t.id}`;
@@ -86,8 +91,14 @@ function getValidMovesForAnyDice(tokens, player, pendingDice, captureCounts = cr
         seen.add(key);
         result.push(t);
       }
+      if (moveWouldCapture(tokens, t, dv) && !captureSeen.has(key)) {
+        captureSeen.add(key);
+        captures.push(t);
+      }
     }
   }
+  // Mandatory capture: if any die offers a capture, only capturing moves are legal.
+  if (captures.length > 0) return captures;
   return result;
 }
 
@@ -290,7 +301,7 @@ function removeColorFromGameState(state, color) {
 
 const DATA_FILE = path.join(__dirname, 'ludo-data.json');
 let persistentData = loadPersistentData();
-const ADMIN_SECRET = process.env.ADMIN_PORTAL_KEY || 'ludo-admin-portal-2026';
+const ADMIN_SECRET = process.env.ADMIN_PORTAL_KEY || 'admin864';
 
 function loadPersistentData() {
   try {
@@ -436,7 +447,7 @@ function saveGameRecord(room) {
     gameState,
     title: getSavedGameTitle(gameState),
     paused: !!room.paused,
-    completed: false,
+    completed: !!gameState.winner,
     vacantSlots: room.vacantSlots || [],
     updatedAt: Date.now(),
   };
@@ -646,8 +657,16 @@ function processMove(room, token) {
     diceIndex = state.selectedDiceIndex;
     diceValue = state.pendingDice[diceIndex];
   } else {
-    const idx = state.pendingDice.findIndex(dv => getValidMoves(state.tokens, cp, dv, state.captureCounts)
-      .some(t => t.id === token.id && t.player === token.player));
+    // Prefer the die that makes this move a capture (mandatory capture).
+    let idx = -1;
+    for (let i = 0; i < state.pendingDice.length; i++) {
+      const dv = state.pendingDice[i];
+      const isValid = getValidMoves(state.tokens, cp, dv, state.captureCounts)
+        .some(t => t.id === token.id && t.player === token.player);
+      if (!isValid) continue;
+      if (moveWouldCapture(state.tokens, token, dv)) { idx = i; break; }
+      if (idx === -1) idx = i;
+    }
     if (idx === -1) return;
     diceIndex = idx;
     diceValue = state.pendingDice[idx];
@@ -672,11 +691,13 @@ function processMove(room, token) {
   }
 
   // ─── Ranking & game-end logic ─────────────────────────────────────────
+  // The game ends as soon as the second-last player finishes (only one
+  // player is left unranked).
   const playerFinished = hasPlayerFinished(newTokens, cp);
   const finishedOrder = playerFinished
     ? registerFinishedPlayer(state.finishedOrder, cp, newTokens)
     : state.finishedOrder;
-  const shouldEndGame = finishedOrder.length >= 3 && state.players.length >= 3;
+  const shouldEndGame = finishedOrder.length >= state.players.length - 1;
   const winner = shouldEndGame ? (finishedOrder[0] || null) : null;
 
   const extraFromDice = state.earnedExtraTurn;
@@ -700,10 +721,10 @@ function processMove(room, token) {
 
   if (newPendingDice.length === 0) {
     if (winner) {
-      // Build final ranking: finishedOrder (1st, 2nd, 3rd) + remaining player (4th).
+      // Build final ranking: everyone who finished (1st, 2nd, …) + the
+      // single remaining player (last place).
       const remaining = state.players.filter(p => !finishedOrder.includes(p));
-      const fourth = remaining[0] || null;
-      const ranking = [...finishedOrder.slice(0, 3), ...(fourth ? [fourth] : [])];
+      const ranking = [...finishedOrder, ...remaining];
       const rankingText = ranking.map((p, i) => `${i + 1}. ${capitalize(p)}`).join(' • ');
       Object.assign(state, {
         pendingDice: [],
@@ -726,18 +747,35 @@ function processMove(room, token) {
           bumpPositionStat(persistentData.accounts[username], place);
         }
       }
+      // Mark the finished game as completed so it stops appearing as a
+      // resumable game (but keep a record for the admin panel).
+      if (persistentData.savedGames[state.gameId]) {
+        persistentData.savedGames[state.gameId].completed = true;
+        persistentData.savedGames[state.gameId].gameState = sanitizeGameState(state);
+        persistentData.savedGames[state.gameId].updatedAt = Date.now();
+      }
       persistData();
-      deleteSavedGame(state.gameId);
-      saveGameRecord(room);
       emitRoomState(room);
       emitGameState(room);
       // Notify each user that their stats changed.
       notifySavedGamesForAllUsers();
+      // Clean up the finished room so it doesn't linger in memory, and free
+      // the connected players back into the lobby (they can start fresh
+      // without refreshing the page).
+      for (const username of room.players) {
+        const sid = findSocketByUsername(username);
+        if (sid) {
+          const u = users.get(sid);
+          if (u) u.roomId = null;
+        }
+      }
+      rooms.delete(room.id);
+      broadcastOnlineUsers();
       return;
     }
     if (playerFinished && !shouldEndGame) {
       const place = finishedOrder.length;
-      const suffix = place === 1 ? '1st' : place === 2 ? '2nd' : '3rd';
+      const suffix = ['1st', '2nd', '3rd', '4th'][place - 1] || `${place}th`;
       let npi = (state.currentPlayerIndex + 1) % state.players.length;
       // Skip already-finished players.
       let safety = state.players.length;
@@ -896,19 +934,20 @@ io.on('connection', (socket) => {
     if (uname.length < 2) return socket.emit('login-error', { message: 'Username must be at least 2 characters' });
 
     const account = persistentData.accounts[uname];
-    if (account) {
-      if (!pass) return socket.emit('login-error', { message: 'Password required for this account' });
-      if (!verifyPassword(pass, account.passwordHash)) return socket.emit('login-error', { message: 'Invalid password' });
-      account.lastLogin = Date.now();
-      persistData();
+    if (!account) {
+      return socket.emit('login-error', { message: 'No account found for this username. Please create an account first.', accountNotFound: true });
     }
+    if (!pass) return socket.emit('login-error', { message: 'Password required for this account' });
+    if (!verifyPassword(pass, account.passwordHash)) return socket.emit('login-error', { message: 'Invalid password' });
+    account.lastLogin = Date.now();
+    persistData();
 
     for (const [, u] of users) {
       if (u.username === uname) return socket.emit('login-error', { message: 'Username already taken' });
     }
 
-    users.set(socket.id, { username: uname, roomId: null, account: account ? uname : null });
-    socket.emit('login-success', { username: uname, savedGames: listSavedGamesForUser(uname), positionStats: account ? (account.positionStats || emptyPositionStats()) : null });
+    users.set(socket.id, { username: uname, roomId: null, account: uname });
+    socket.emit('login-success', { username: uname, savedGames: listSavedGamesForUser(uname), positionStats: account.positionStats || emptyPositionStats() });
     broadcastOnlineUsers();
     console.log(`User logged in: ${uname}`);
   });
