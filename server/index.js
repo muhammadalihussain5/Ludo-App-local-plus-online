@@ -614,6 +614,18 @@ function emitGameState(room) {
   io.to(room.id).emit('game-state', { gameState: sanitizeGameState(room.gameState) });
 }
 
+// Broadcast the current voice-chat participants (and their mute/deafen state)
+// to everyone in the room. Voice audio itself is peer-to-peer WebRTC; the
+// server only relays signaling messages and this participant list.
+function emitVoiceUsers(room) {
+  const list = Object.entries(room.voiceUsers || {}).map(([username, s]) => ({
+    username,
+    muted: !!s.muted,
+    deafened: !!s.deafened,
+  }));
+  io.to(room.id).emit('voice-users', { users: list });
+}
+
 function hydrateRoomFromSavedGame(savedGame) {
   if (rooms.has(savedGame.roomId)) return rooms.get(savedGame.roomId);
   const room = {
@@ -629,6 +641,7 @@ function hydrateRoomFromSavedGame(savedGame) {
     paused: !!savedGame.paused,
     vacantSlots: savedGame.vacantSlots || [],
     pendingReplacements: {},
+    voiceUsers: {},
   };
   rooms.set(room.id, room);
   return room;
@@ -885,6 +898,9 @@ function processMove(room, token) {
           if (u) u.roomId = null;
         }
       }
+      // The room is gone, so tell connected clients to tear down their
+      // peer-to-peer voice sessions.
+      io.to(room.id).emit('voice-reset', {});
       rooms.delete(room.id);
       broadcastOnlineUsers();
       return;
@@ -1084,6 +1100,7 @@ io.on('connection', (socket) => {
       paused: false,
       vacantSlots: [],
       pendingReplacements: {},
+      voiceUsers: {},
     });
     user.roomId = roomId;
     socket.join(roomId);
@@ -1199,6 +1216,10 @@ io.on('connection', (socket) => {
     room.players = room.players.filter(p => p !== user.username);
     delete room.playerColors[user.username];
     delete room.playerSockets[user.username];
+    if (room.voiceUsers && room.voiceUsers[user.username]) {
+      delete room.voiceUsers[user.username];
+      emitVoiceUsers(room);
+    }
     user.roomId = null;
     socket.leave(roomId);
 
@@ -1317,6 +1338,57 @@ io.on('connection', (socket) => {
     emitGameState(room);
   });
 
+  // ─── Voice chat signaling (WebRTC peer-to-peer) ─────────────────────────
+  // The audio stream never touches this server — it only relays SDP offers,
+  // answers and ICE candidates between players in the same room, and keeps a
+  // room-local list of who is in voice chat.
+
+  socket.on('voice-join', ({ roomId }) => {
+    const room = rooms.get(roomId);
+    if (!room) return;
+    const user = users.get(socket.id);
+    if (!user || !room.players.includes(user.username)) return;
+    room.voiceUsers = room.voiceUsers || {};
+    room.voiceUsers[user.username] = { muted: false, deafened: false };
+    emitVoiceUsers(room);
+  });
+
+  socket.on('voice-leave', ({ roomId }) => {
+    const room = rooms.get(roomId);
+    if (!room) return;
+    const user = users.get(socket.id);
+    if (!user) return;
+    room.voiceUsers = room.voiceUsers || {};
+    if (room.voiceUsers[user.username]) {
+      delete room.voiceUsers[user.username];
+      emitVoiceUsers(room);
+    }
+  });
+
+  socket.on('voice-state', ({ roomId, muted, deafened }) => {
+    const room = rooms.get(roomId);
+    if (!room) return;
+    const user = users.get(socket.id);
+    if (!user) return;
+    room.voiceUsers = room.voiceUsers || {};
+    if (room.voiceUsers[user.username]) {
+      room.voiceUsers[user.username].muted = !!muted;
+      room.voiceUsers[user.username].deafened = !!deafened;
+      emitVoiceUsers(room);
+    }
+  });
+
+  socket.on('voice-signal', ({ roomId, to, signal }) => {
+    const room = rooms.get(roomId);
+    if (!room) return;
+    const user = users.get(socket.id);
+    if (!user) return;
+    if (!signal || typeof to !== 'string') return;
+    const targetSid = findSocketByUsername(to);
+    if (!targetSid) return;
+    io.to(targetSid).emit('voice-signal', { from: user.username, signal });
+  });
+
   socket.on('continue-without-player', ({ roomId, playerName }) => {
     const room = rooms.get(roomId);
     if (!room || !room.gameState) return;
@@ -1354,6 +1426,10 @@ io.on('connection', (socket) => {
     if (user.roomId) {
       const room = rooms.get(user.roomId);
       if (room) {
+        if (room.voiceUsers && room.voiceUsers[user.username]) {
+          delete room.voiceUsers[user.username];
+          emitVoiceUsers(room);
+        }
         if (room.started) {
           const color = room.playerColors[user.username];
           if (color) {

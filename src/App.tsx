@@ -10,6 +10,8 @@ import {
   getCapturableOpponentTokens, applyMissedCaptureRemoval, formatMissedCaptureMessage, moveWouldCapture,
   registerFinishedPlayer, hasPlayerFinished,
 } from './gameLogic';
+import { useVoiceChat, type VoiceChatApi } from './voice';
+import { VoicePanel } from './VoicePanel';
 
 const DEFAULT_OPTIONS: GameOptions = {
   extraRollOnEntry: true, extraTurnOnCapture: true,
@@ -468,9 +470,10 @@ function OnlineLoginScreen({ onConnect }: { onConnect: (socket: Socket, username
 
 // ─── Online Lobby Screen ─────────────────────────────────────────────────────
 
-function OnlineLobbyScreen({ socket, username, onlineUsers, roomInfo, invites, savedGames, positionStats, onBack, onResumeGame }: {
+function OnlineLobbyScreen({ socket, username, onlineUsers, roomInfo, invites, savedGames, positionStats, voice, onBack, onResumeGame }: {
   socket: Socket; username: string; onlineUsers: string[]; roomInfo: RoomInfo | null;
   invites: InviteInfo[]; savedGames: SavedGameSummary[]; positionStats: PositionStats | null;
+  voice: VoiceChatApi;
   onBack: () => void; onResumeGame: (gameId: string) => void;
 }) {
   const [playerCount, setPlayerCount] = useState(4);
@@ -659,6 +662,7 @@ function OnlineLobbyScreen({ socket, username, onlineUsers, roomInfo, invites, s
                 🎮 Start Game!
               </button>
             )}
+            <VoicePanel voice={voice} me={username} />
           </div>
         )}
 
@@ -1148,6 +1152,18 @@ export default function App() {
   const [onlineSavedGames, setOnlineSavedGames] = useState<SavedGameSummary[]>([]);
   const [positionStats, setPositionStats] = useState<PositionStats | null>(null);
 
+  // Voice chat (WebRTC mesh, Socket.IO signaling) — only for online rooms.
+  const voice = useVoiceChat({
+    socket,
+    roomId: roomInfo?.id ?? null,
+    username: onlineUsername,
+  });
+
+  // When an online game ends the room is torn down server-side; leave voice.
+  useEffect(() => {
+    if (onlineGameState?.winner) voice.leave();
+  }, [onlineGameState?.winner, voice.leave]);
+
   // Local game refs
   const stateRef = useRef<GameState | null>(null);
   const rollingRef = useRef(false);
@@ -1605,7 +1621,7 @@ export default function App() {
   }
 
   if (screen === 'online-lobby') {
-    return <>{adminPortal}<OnlineLobbyScreen socket={socket!} username={onlineUsername} onlineUsers={onlineUsers} roomInfo={roomInfo} invites={invites} savedGames={onlineSavedGames} positionStats={positionStats}
+    return <>{adminPortal}<OnlineLobbyScreen socket={socket!} username={onlineUsername} onlineUsers={onlineUsers} roomInfo={roomInfo} invites={invites} savedGames={onlineSavedGames} positionStats={positionStats} voice={voice}
       onResumeGame={resumeOnlineGame}
       onBack={() => { socket?.disconnect(); setSocket(null); setRoomInfo(null); setInvites([]); setOnlineUsers([]); setOnlineSavedGames([]); setPositionStats(null); setScreen('start'); }} />;
     </>;
@@ -1698,7 +1714,7 @@ export default function App() {
         if (isOnline) { socket?.disconnect(); setSocket(null); setOnlineGameState(null); setRoomInfo(null); setMyColor(null); setInvites([]); }
         else { setGameState(null); }
         setScreen('start');
-      }} /></>;
+      }} />{isOnline && roomInfo && <VoicePanel voice={voice} me={onlineUsername} floating />}</>;
   }
 
   return null;
