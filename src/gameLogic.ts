@@ -47,10 +47,14 @@ export interface GameState {
   // Whether the current roll had a 6 (for "choose" mode override)
   rollHasSix: boolean;
   captureCounts: Record<PlayerColor, number>;
-  // Opponent token keys (`${player}-${id}`) that were capturable when the move
-  // phase began. Any of these still on the board when the player finishes
-  // moving are sent home (missed-capture removal).
+  // The current player's OWN token keys (`${player}-${id}`) that could have
+  // captured an opponent when the move phase began. If the player ends the
+  // turn without capturing, any of these still on the board are sent home
+  // (the missed-capture penalty).
   missedCaptureTargets: string[];
+  // True if the current player captured at least once during this move phase.
+  // Taking a real capture cancels the missed-capture penalty.
+  capturedThisTurn: boolean;
 }
 
 export const PLAYER_COLORS: Record<PlayerColor, { bg: string; light: string; dark: string; text: string; border: string }> = {
@@ -264,8 +268,8 @@ export function moveWouldCapture(tokens: Token[], token: Token, diceValue: numbe
 //
 // A capture is no longer forced on the player: every legal move is allowed.
 // Instead, if a capture was possible during the turn and the player did not
-// take it, the OPPONENT piece that could have been captured is removed from
-// the board anyway. Detection must cover:
+// take it, the PLAYER'S OWN piece that could have captured is sent back to its
+// home base (the opponent piece stays put). Detection must cover:
 //   1. each individual die value,
 //   2. the sum of the dice (two-dice "both" mode: one piece moving d1 + d2),
 //   3. any combination/sequence of the dice applied to the same piece
@@ -298,66 +302,48 @@ export function getReachableTotals(pendingDice: number[], options?: GameOptions)
   return [...totals].sort((a, b) => a - b);
 }
 
-// Returns the opponent tokens that `player` could capture this turn using any
-// reachable total from `pendingDice`. Each entry is the actual opponent token
-// object (still on the board). Safe landing squares never count, and a piece
-// still in its home base (steps === -1) cannot capture by moving out — both
-// rules are enforced by `moveWouldCapture`.
-export function getCapturableOpponentTokens(
+// Returns the PLAYER's OWN tokens that could capture an opponent this turn
+// using any reachable total from `pendingDice`. Safe landing squares never
+// count, and a piece still in its home base (steps === -1) cannot capture by
+// moving out — both rules are enforced by `moveWouldCapture`.
+export function getCapturableOwnTokens(
   tokens: Token[],
   player: PlayerColor,
   pendingDice: number[],
   options?: GameOptions,
 ): Token[] {
   const totals = getReachableTotals(pendingDice, options);
-  const capturable = new Map<string, Token>();
-  for (const t of tokens) {
-    if (t.player !== player || t.steps === -1 || t.steps >= 56) continue;
-    for (const total of totals) {
-      if (!moveWouldCapture(tokens, t, total)) continue;
-      const newSteps = t.steps + total;
-      if (newSteps < 0 || newSteps > 50) continue;
-      const pathIndex = (START_INDICES[t.player] + newSteps) % 52;
-      for (const ot of tokens) {
-        if (ot.player === player || ot.steps < 0 || ot.steps > 50) continue;
-        if ((START_INDICES[ot.player] + ot.steps) % 52 === pathIndex) {
-          capturable.set(`${ot.player}-${ot.id}`, ot);
-        }
-      }
-    }
-  }
-  return [...capturable.values()];
+  return tokens
+    .filter(t => t.player === player)
+    .filter(t => totals.some(total => moveWouldCapture(tokens, t, total)));
 }
 
-// Send home every capturable opponent token (identified by its key in
-// `targetKeys`) that is still on the board. Each removal counts as a capture
-// for the moving player (so home entry unlocks), but no extra turn is granted.
-export function applyMissedCaptureRemoval(
+// Send home the moving player's own capturable tokens (identified by their key
+// in `targetKeys`) that are still on the board. This is a penalty — it does
+// not count as a capture, does not increment captureCounts, and grants no
+// extra turn.
+export function applyMissedCapturePenalty(
   tokens: Token[],
   player: PlayerColor,
   targetKeys: string[],
-  captureCounts: Record<PlayerColor, number>,
-): { tokens: Token[]; removedColors: PlayerColor[]; captureCounts: Record<PlayerColor, number> } {
+): { tokens: Token[]; removedCount: number } {
   const keys = new Set(targetKeys);
-  const removedColors: PlayerColor[] = [];
-  const newCaptureCounts = { ...captureCounts };
+  let removedCount = 0;
   const newTokens = tokens.map(t => {
-    if (keys.has(`${t.player}-${t.id}`) && t.steps !== -1) {
-      removedColors.push(t.player);
-      newCaptureCounts[player] += 1;
+    if (t.player === player && keys.has(`${t.player}-${t.id}`) && t.steps !== -1) {
+      removedCount += 1;
       return { ...t, steps: -1 };
     }
     return t;
   });
-  return { tokens: newTokens, removedColors, captureCounts: newCaptureCounts };
+  return { tokens: newTokens, removedCount };
 }
 
-// Human-readable message for the missed-capture removal.
-export function formatMissedCaptureMessage(removedColors: PlayerColor[]): string {
-  if (removedColors.length === 0) return '';
-  const names = removedColors.map(c => `${capitalize(c)}'s`).join(' and ');
-  const noun = removedColors.length > 1 ? 'pieces were' : 'piece was';
-  return `⚠️ Missed capture — ${names} ${noun} sent home!`;
+// Human-readable message for the missed-capture penalty.
+export function formatMissedCaptureMessage(player: PlayerColor, count: number): string {
+  if (count === 0) return '';
+  const noun = count > 1 ? 'pieces were' : 'piece was';
+  return `⚠️ Missed capture — ${capitalize(player)}'s ${noun} sent home!`;
 }
 
 export function checkWin(tokens: Token[], player: PlayerColor): boolean {
@@ -507,6 +493,7 @@ export function createInitialState(players: PlayerColor[], options: GameOptions)
     rollHasSix: false,
     captureCounts: createEmptyCaptureCounts(),
     missedCaptureTargets: [],
+    capturedThisTurn: false,
     finishedOrder: [],
   };
 }

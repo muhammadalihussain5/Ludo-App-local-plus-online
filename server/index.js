@@ -95,9 +95,10 @@ function getValidMovesForAnyDice(tokens, player, pendingDice, captureCounts = cr
 //
 // A capture is no longer forced: every legal move is allowed. Instead, if a
 // capture was possible during the turn and the player did not take it, the
-// OPPONENT piece that could have been captured is removed from the board.
-// Detection covers each individual die, the sum of two dice ("both" mode),
-// and any combination/sequence of the accumulated dice applied to one piece.
+// PLAYER'S OWN piece that could have captured is sent back to its home base
+// (the opponent piece stays put). Detection covers each individual die, the
+// sum of two dice ("both" mode), and any combination/sequence of the
+// accumulated dice applied to one piece.
 
 function moveWouldCapture(tokens, token, diceValue) {
   if (token.steps === -1) return false;
@@ -135,52 +136,37 @@ function getReachableTotals(pendingDice, options) {
   return [...totals].sort((a, b) => a - b);
 }
 
-// The opponent tokens `player` could capture this turn using any reachable
-// total from pendingDice. Safe squares and home-base pieces are excluded by
-// moveWouldCapture.
-function getCapturableOpponentTokens(tokens, player, pendingDice, options) {
+// The PLAYER's OWN tokens that could capture an opponent this turn using any
+// reachable total from pendingDice. Safe squares and home-base pieces are
+// excluded by moveWouldCapture.
+function getCapturableOwnTokens(tokens, player, pendingDice, options) {
   const totals = getReachableTotals(pendingDice, options);
-  const capturable = new Map();
-  for (const t of tokens) {
-    if (t.player !== player || t.steps === -1 || t.steps >= 56) continue;
-    for (const total of totals) {
-      if (!moveWouldCapture(tokens, t, total)) continue;
-      const newSteps = t.steps + total;
-      if (newSteps < 0 || newSteps > 50) continue;
-      const pathIndex = (START_INDICES[t.player] + newSteps) % 52;
-      for (const ot of tokens) {
-        if (ot.player === player || ot.steps < 0 || ot.steps > 50) continue;
-        if ((START_INDICES[ot.player] + ot.steps) % 52 === pathIndex) {
-          capturable.set(`${ot.player}-${ot.id}`, ot);
-        }
-      }
-    }
-  }
-  return [...capturable.values()];
+  return tokens
+    .filter(t => t.player === player)
+    .filter(t => totals.some(total => moveWouldCapture(tokens, t, total)));
 }
 
-// Send home every capturable opponent (identified by targetKeys) still on the
-// board. Each removal counts as a capture for `player` but grants no extra turn.
-function applyMissedCaptureRemoval(tokens, player, targetKeys, captureCounts) {
+// Send home the moving player's own capturable tokens (identified by key in
+// targetKeys) that are still on the board. This is a penalty — it does not
+// count as a capture, does not increment captureCounts, and grants no extra
+// turn.
+function applyMissedCapturePenalty(tokens, player, targetKeys) {
   const keys = new Set(targetKeys || []);
-  const removedColors = [];
-  const newCaptureCounts = { ...captureCounts };
+  let removedCount = 0;
   const newTokens = tokens.map(t => {
-    if (keys.has(`${t.player}-${t.id}`) && t.steps !== -1) {
-      removedColors.push(t.player);
-      newCaptureCounts[player] += 1;
+    if (t.player === player && keys.has(`${t.player}-${t.id}`) && t.steps !== -1) {
+      removedCount += 1;
       return { ...t, steps: -1 };
     }
     return t;
   });
-  return { tokens: newTokens, removedColors, captureCounts: newCaptureCounts };
+  return { tokens: newTokens, removedCount };
 }
 
-function formatMissedCaptureMessage(removedColors) {
-  if (removedColors.length === 0) return '';
-  const names = removedColors.map(c => `${capitalize(c)}'s`).join(' and ');
-  const noun = removedColors.length > 1 ? 'pieces were' : 'piece was';
-  return `⚠️ Missed capture — ${names} ${noun} sent home!`;
+function formatMissedCaptureMessage(player, count) {
+  if (count === 0) return '';
+  const noun = count > 1 ? 'pieces were' : 'piece was';
+  return `⚠️ Missed capture — ${capitalize(player)}'s ${noun} sent home!`;
 }
 
 function executeMove(tokens, token, diceValue, captureCounts) {
@@ -287,6 +273,7 @@ function createInitialState(players, options, gameId = crypto.randomUUID()) {
     rollHasSix: false,
     captureCounts: createEmptyCaptureCounts(),
     missedCaptureTargets: [],
+    capturedThisTurn: false,
     finishedOrder: [],
   };
 }
@@ -304,6 +291,7 @@ function normalizeGameState(state) {
     pendingExtraRoll: typeof state.pendingExtraRoll === 'boolean' ? state.pendingExtraRoll : !!state.earnedExtraTurn,
     pendingBonusReason: typeof state.pendingBonusReason === 'string' ? state.pendingBonusReason : '',
     missedCaptureTargets: Array.isArray(state.missedCaptureTargets) ? state.missedCaptureTargets.slice() : [],
+    capturedThisTurn: !!state.capturedThisTurn,
   };
   delete normalized.earnedExtraTurn;
   return normalized;
@@ -340,6 +328,7 @@ function removeColorFromGameState(state, color) {
     pendingExtraRoll: false,
     pendingBonusReason: '',
     missedCaptureTargets: [],
+    capturedThisTurn: false,
     consecutiveSixes: 0,
     rollHasSix: false,
     turnSnapshot: tokens.map(t => ({ ...t })),
@@ -695,6 +684,7 @@ function processRoll(room, diceValues) {
       pendingExtraRoll: false,
       pendingBonusReason: '',
       missedCaptureTargets: [],
+      capturedThisTurn: false,
       consecutiveSixes: 0,
       rollHasSix: false,
       turnSnapshot: restored.map(t => ({ ...t })),
@@ -732,7 +722,7 @@ function processRoll(room, diceValues) {
   // No more bonus rolls: the player moves with the full accumulated pool.
   const anyValid = getValidMovesForAnyDice(state.tokens, player, pendingDice, state.captureCounts);
   const hasValidMoves = anyValid.length > 0;
-  const captureTargets = getCapturableOpponentTokens(state.tokens, player, pendingDice, state.options)
+  const captureTargets = getCapturableOwnTokens(state.tokens, player, pendingDice, state.options)
     .map(t => `${t.player}-${t.id}`);
 
   let message = state.options.diceCount === 1
@@ -751,6 +741,7 @@ function processRoll(room, diceValues) {
     consecutiveSixes: newConsecutiveSixes,
     rollHasSix: hasSix,
     missedCaptureTargets: captureTargets,
+    capturedThisTurn: false,
     message,
   });
 
@@ -765,6 +756,7 @@ function processRoll(room, diceValues) {
       consecutiveSixes: 0,
       rollHasSix: false,
       missedCaptureTargets: [],
+      capturedThisTurn: false,
       turnSnapshot: state.tokens.map(t => ({ ...t })),
       message: `${capitalize(state.players[npi])}'s turn - Roll the dice!`,
     });
@@ -807,6 +799,7 @@ function processMove(room, token) {
 
   const newTokens = movedTokens;
   const newCaptureCounts = captureCounts;
+  const capturedThisTurn = state.capturedThisTurn || captured;
 
   // ─── Ranking & game-end logic ─────────────────────────────────────────
   // The game ends as soon as the second-last player finishes (only one
@@ -838,16 +831,20 @@ function processMove(room, token) {
   state.captureCounts = newCaptureCounts;
   state.finishedOrder = finishedOrder;
   state.pendingBonusReason = pendingBonusReason;
+  state.capturedThisTurn = capturedThisTurn;
 
   if (newPendingDice.length === 0) {
-    // ─── Missed-capture removal ─────────────────────────────────────────
-    // Any opponent piece that was capturable when the move phase began and
-    // is still on the board is sent home now that the player is done moving.
-    const removal = applyMissedCaptureRemoval(state.tokens, cp, state.missedCaptureTargets, state.captureCounts);
-    state.tokens = removal.tokens;
-    state.captureCounts = removal.captureCounts;
+    // ─── Missed-capture penalty ─────────────────────────────────────────
+    // A capture is no longer forced. If the player ends the turn without
+    // capturing, any of their OWN pieces that could have captured (when the
+    // move phase began) and are still on the board are sent home.
+    const penalty = capturedThisTurn
+      ? { tokens: state.tokens, removedCount: 0 }
+      : applyMissedCapturePenalty(state.tokens, cp, state.missedCaptureTargets);
+    state.tokens = penalty.tokens;
     state.missedCaptureTargets = [];
-    const missedMessage = formatMissedCaptureMessage(removal.removedColors);
+    state.capturedThisTurn = false;
+    const missedMessage = formatMissedCaptureMessage(cp, penalty.removedCount);
 
     if (winner) {
       // Build final ranking: everyone who finished (1st, 2nd, …) + the
