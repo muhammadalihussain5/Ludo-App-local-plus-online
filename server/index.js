@@ -68,22 +68,17 @@ function getCurrentPlayer(state) {
 }
 
 function getValidMoves(tokens, player, diceValue, captureCounts = createEmptyCaptureCounts()) {
-  const valid = tokens.filter(t => t.player === player).filter(token => {
+  return tokens.filter(t => t.player === player).filter(token => {
     if (token.steps === -1) return diceValue === 6;
     if (token.steps >= 56) return false;
     if (token.steps < 51 && token.steps + diceValue > 50 && captureCounts[player] <= 0) return false;
     return token.steps + diceValue <= 56;
   });
-  // Mandatory capture: if any valid move captures, only capturing moves are legal.
-  const captures = valid.filter(token => moveWouldCapture(tokens, token, diceValue));
-  return captures.length > 0 ? captures : valid;
 }
 
 function getValidMovesForAnyDice(tokens, player, pendingDice, captureCounts = createEmptyCaptureCounts()) {
   const seen = new Set();
   const result = [];
-  const captureSeen = new Set();
-  const captures = [];
   for (const dv of pendingDice) {
     for (const t of getValidMoves(tokens, player, dv, captureCounts)) {
       const key = `${t.player}-${t.id}`;
@@ -91,18 +86,19 @@ function getValidMovesForAnyDice(tokens, player, pendingDice, captureCounts = cr
         seen.add(key);
         result.push(t);
       }
-      if (moveWouldCapture(tokens, t, dv) && !captureSeen.has(key)) {
-        captureSeen.add(key);
-        captures.push(t);
-      }
     }
   }
-  // Mandatory capture: if any die offers a capture, only capturing moves are legal.
-  if (captures.length > 0) return captures;
   return result;
 }
 
-// ─── Mandatory capture helpers (server-side) ───────────────────────────────
+// ─── Missed-capture (mandatory capture) helpers (server-side) ──────────────
+//
+// A capture is no longer forced: every legal move is allowed. Instead, if a
+// capture was possible during the turn and the player did not take it, the
+// PLAYER'S OWN piece that could have captured is sent back to its home base
+// (the opponent piece stays put). Detection covers each individual die, the
+// sum of two dice ("both" mode), and any combination/sequence of the
+// accumulated dice applied to one piece.
 
 function moveWouldCapture(tokens, token, diceValue) {
   if (token.steps === -1) return false;
@@ -116,34 +112,61 @@ function moveWouldCapture(tokens, token, diceValue) {
   );
 }
 
-function hasCaptureAvailable(tokens, player, diceValue, captureCounts = createEmptyCaptureCounts()) {
-  const moves = getValidMoves(tokens, player, diceValue, captureCounts);
-  return moves.some(t => moveWouldCapture(tokens, t, diceValue));
-}
-
-function getCapturableTokenIds(tokens, player, chosenToken, diceValue) {
-  const ids = new Set();
-  for (const t of tokens) {
-    if (t.player !== player) continue;
-    if (t.id === chosenToken.id) continue;
-    if (t.steps === -1 || t.steps >= 56) continue;
-    if (moveWouldCapture(tokens, t, diceValue)) {
-      ids.add(t.id);
-    }
+// Every distinct total reachable by using any non-empty subset of pendingDice.
+// In two-dice "choose" mode the player only ever uses one die of the pair, so
+// only the individual values are reachable there.
+function getReachableTotals(pendingDice, options) {
+  if (options && options.diceCount === 2 && options.twoDiceMode === 'choose') {
+    return [...new Set(pendingDice)];
   }
-  return ids;
+  const counts = new Map();
+  for (const dv of pendingDice) counts.set(dv, (counts.get(dv) || 0) + 1);
+  const unique = [...counts.keys()];
+  const totals = new Set();
+  const rec = (i, sum) => {
+    if (i === unique.length) {
+      if (sum > 0) totals.add(sum);
+      return;
+    }
+    const value = unique[i];
+    const max = counts.get(value);
+    for (let k = 0; k <= max; k++) rec(i + 1, sum + value * k);
+  };
+  rec(0, 0);
+  return [...totals].sort((a, b) => a - b);
 }
 
-function applyMandatoryCapturePenalty(tokensToUpdate, player, chosenToken, capturableIds) {
-  const newTokens = tokensToUpdate.map(t => {
-    if (t.player !== player) return t;
-    if (t.id === chosenToken.id) return t;
-    if (capturableIds.has(t.id) && t.steps !== -1) {
+// The PLAYER's OWN tokens that could capture an opponent this turn using any
+// reachable total from pendingDice. Safe squares and home-base pieces are
+// excluded by moveWouldCapture.
+function getCapturableOwnTokens(tokens, player, pendingDice, options) {
+  const totals = getReachableTotals(pendingDice, options);
+  return tokens
+    .filter(t => t.player === player)
+    .filter(t => totals.some(total => moveWouldCapture(tokens, t, total)));
+}
+
+// Send home the moving player's own capturable tokens (identified by key in
+// targetKeys) that are still on the board. This is a penalty — it does not
+// count as a capture, does not increment captureCounts, and grants no extra
+// turn.
+function applyMissedCapturePenalty(tokens, player, targetKeys) {
+  const keys = new Set(targetKeys || []);
+  let removedCount = 0;
+  const newTokens = tokens.map(t => {
+    if (t.player === player && keys.has(`${t.player}-${t.id}`) && t.steps !== -1) {
+      removedCount += 1;
       return { ...t, steps: -1 };
     }
     return t;
   });
-  return { tokens: newTokens };
+  return { tokens: newTokens, removedCount };
+}
+
+function formatMissedCaptureMessage(player, count) {
+  if (count === 0) return '';
+  const noun = count > 1 ? 'pieces were' : 'piece was';
+  return `⚠️ Missed capture — ${capitalize(player)}'s ${noun} sent home!`;
 }
 
 function executeMove(tokens, token, diceValue, captureCounts) {
@@ -242,25 +265,36 @@ function createInitialState(players, options, gameId = crypto.randomUUID()) {
     gameStarted: true,
     message: `${capitalize(players[0])}'s turn - Roll the dice!`,
     options,
-    earnedExtraTurn: false,
+    pendingExtraRoll: false,
+    pendingBonusReason: '',
     isTransitioning: false,
     turnSnapshot: tokens.map(t => ({ ...t })),
     consecutiveSixes: 0,
     rollHasSix: false,
     captureCounts: createEmptyCaptureCounts(),
+    missedCaptureTargets: [],
+    capturedThisTurn: false,
     finishedOrder: [],
   };
 }
 
 function normalizeGameState(state) {
   if (!state) return null;
-  return {
+  const normalized = {
     ...state,
     gameId: state.gameId || crypto.randomUUID(),
     captureCounts: state.captureCounts || createEmptyCaptureCounts(),
     finishedOrder: Array.isArray(state.finishedOrder) ? state.finishedOrder.slice() : [],
     turnSnapshot: Array.isArray(state.turnSnapshot) ? state.turnSnapshot.map(t => ({ ...t })) : state.tokens.map(t => ({ ...t })),
+    // Migrate saves that predate the rename: earnedExtraTurn meant "must roll
+    // again before moving", which maps to pendingExtraRoll.
+    pendingExtraRoll: typeof state.pendingExtraRoll === 'boolean' ? state.pendingExtraRoll : !!state.earnedExtraTurn,
+    pendingBonusReason: typeof state.pendingBonusReason === 'string' ? state.pendingBonusReason : '',
+    missedCaptureTargets: Array.isArray(state.missedCaptureTargets) ? state.missedCaptureTargets.slice() : [],
+    capturedThisTurn: !!state.capturedThisTurn,
   };
+  delete normalized.earnedExtraTurn;
+  return normalized;
 }
 
 function removeColorFromGameState(state, color) {
@@ -291,7 +325,10 @@ function removeColorFromGameState(state, color) {
     diceValues: [],
     pendingDice: [],
     selectedDiceIndex: null,
-    earnedExtraTurn: false,
+    pendingExtraRoll: false,
+    pendingBonusReason: '',
+    missedCaptureTargets: [],
+    capturedThisTurn: false,
     consecutiveSixes: 0,
     rollHasSix: false,
     turnSnapshot: tokens.map(t => ({ ...t })),
@@ -566,6 +603,18 @@ function emitGameState(room) {
   io.to(room.id).emit('game-state', { gameState: sanitizeGameState(room.gameState) });
 }
 
+// Broadcast the current voice-chat participants (and their mute/deafen state)
+// to everyone in the room. Voice audio itself is peer-to-peer WebRTC; the
+// server only relays signaling messages and this participant list.
+function emitVoiceUsers(room) {
+  const list = Object.entries(room.voiceUsers || {}).map(([username, s]) => ({
+    username,
+    muted: !!s.muted,
+    deafened: !!s.deafened,
+  }));
+  io.to(room.id).emit('voice-users', { users: list });
+}
+
 function hydrateRoomFromSavedGame(savedGame) {
   if (rooms.has(savedGame.roomId)) return rooms.get(savedGame.roomId);
   const room = {
@@ -581,6 +630,7 @@ function hydrateRoomFromSavedGame(savedGame) {
     paused: !!savedGame.paused,
     vacantSlots: savedGame.vacantSlots || [],
     pendingReplacements: {},
+    voiceUsers: {},
   };
   rooms.set(room.id, room);
   return room;
@@ -631,7 +681,10 @@ function processRoll(room, diceValues) {
       pendingDice: [],
       selectedDiceIndex: null,
       currentPlayerIndex: npi,
-      earnedExtraTurn: false,
+      pendingExtraRoll: false,
+      pendingBonusReason: '',
+      missedCaptureTargets: [],
+      capturedThisTurn: false,
       consecutiveSixes: 0,
       rollHasSix: false,
       turnSnapshot: restored.map(t => ({ ...t })),
@@ -643,10 +696,34 @@ function processRoll(room, diceValues) {
     return;
   }
 
-  const pendingDice = state.options.diceCount === 1 ? [diceValues[0]] : [...diceValues];
+  // Accumulate this roll onto the pool from earlier bonus rolls.
+  const pendingDice = [...state.pendingDice, ...diceValues];
+  const newDiceValues = [...state.pendingDice, ...diceValues];
+
+  // If this roll earns another roll, keep rolling BEFORE moving.
+  const extraFromDice = shouldGetExtraTurnFromDice(state.options, diceValues);
+  if (extraFromDice) {
+    Object.assign(state, {
+      diceValues: newDiceValues,
+      pendingDice,
+      selectedDiceIndex: null,
+      diceRolled: false,
+      pendingExtraRoll: true,
+      consecutiveSixes: newConsecutiveSixes,
+      rollHasSix: hasSix,
+      message: state.options.diceCount === 1
+        ? `${capitalize(player)} rolled a 6! Roll again!`
+        : `${capitalize(player)} rolled double 6! Roll again!`,
+    });
+    saveGameRecord(room);
+    return;
+  }
+
+  // No more bonus rolls: the player moves with the full accumulated pool.
   const anyValid = getValidMovesForAnyDice(state.tokens, player, pendingDice, state.captureCounts);
   const hasValidMoves = anyValid.length > 0;
-  const extraFromDice = shouldGetExtraTurnFromDice(state.options, diceValues);
+  const captureTargets = getCapturableOwnTokens(state.tokens, player, pendingDice, state.options)
+    .map(t => `${t.player}-${t.id}`);
 
   let message = state.options.diceCount === 1
     ? `${capitalize(player)} rolled a ${diceValues[0]}!`
@@ -656,40 +733,33 @@ function processRoll(room, diceValues) {
   else message += ' Select a die, then tap a token.';
 
   Object.assign(state, {
-    diceValues,
+    diceValues: newDiceValues,
     pendingDice,
     selectedDiceIndex: pendingDice.length === 1 ? 0 : null,
     diceRolled: true,
-    earnedExtraTurn: extraFromDice,
+    pendingExtraRoll: false,
     consecutiveSixes: newConsecutiveSixes,
     rollHasSix: hasSix,
+    missedCaptureTargets: captureTargets,
+    capturedThisTurn: false,
     message,
   });
 
   if (!hasValidMoves) {
-    if (extraFromDice) {
-      Object.assign(state, {
-        diceRolled: false,
-        diceValues: [],
-        pendingDice: [],
-        selectedDiceIndex: null,
-        earnedExtraTurn: false,
-        message: `${capitalize(player)} gets another turn! (${state.options.diceCount === 1 ? 'rolled 6' : 'double 6'})`,
-      });
-    } else {
-      const npi = (state.currentPlayerIndex + 1) % state.players.length;
-      Object.assign(state, {
-        diceRolled: false,
-        diceValues: [],
-        pendingDice: [],
-        selectedDiceIndex: null,
-        currentPlayerIndex: npi,
-        consecutiveSixes: 0,
-        rollHasSix: false,
-        turnSnapshot: state.tokens.map(t => ({ ...t })),
-        message: `${capitalize(state.players[npi])}'s turn - Roll the dice!`,
-      });
-    }
+    const npi = (state.currentPlayerIndex + 1) % state.players.length;
+    Object.assign(state, {
+      diceRolled: false,
+      diceValues: [],
+      pendingDice: [],
+      selectedDiceIndex: null,
+      currentPlayerIndex: npi,
+      consecutiveSixes: 0,
+      rollHasSix: false,
+      missedCaptureTargets: [],
+      capturedThisTurn: false,
+      turnSnapshot: state.tokens.map(t => ({ ...t })),
+      message: `${capitalize(state.players[npi])}'s turn - Roll the dice!`,
+    });
   }
 
   saveGameRecord(room);
@@ -705,7 +775,9 @@ function processMove(room, token) {
     diceIndex = state.selectedDiceIndex;
     diceValue = state.pendingDice[diceIndex];
   } else {
-    // Prefer the die that makes this move a capture (mandatory capture).
+    // Prefer the die that makes this move a capture (a convenience, not a
+    // restriction — captures are no longer mandatory); otherwise use the
+    // first die that makes the token a valid move.
     let idx = -1;
     for (let i = 0; i < state.pendingDice.length; i++) {
       const dv = state.pendingDice[i];
@@ -725,18 +797,9 @@ function processMove(room, token) {
 
   const { tokens: movedTokens, captured, enteredBoard, captureCounts } = executeMove(state.tokens, token, diceValue, state.captureCounts);
 
-  // ─── Mandatory capture penalty (server) ────────────────────────────────
-  let newTokens = movedTokens;
-  let newCaptureCounts = captureCounts;
-  let penaltyMessage = '';
-  if (!captured && hasCaptureAvailable(state.tokens, cp, diceValue, state.captureCounts)) {
-    const capturableIds = getCapturableTokenIds(state.tokens, cp, token, diceValue);
-    if (capturableIds.size > 0) {
-      const penalty = applyMandatoryCapturePenalty(movedTokens, cp, token, capturableIds);
-      newTokens = penalty.tokens;
-      penaltyMessage = ' ⚠️ Missed a capture — your capturable pieces were sent home!';
-    }
-  }
+  const newTokens = movedTokens;
+  const newCaptureCounts = captureCounts;
+  const capturedThisTurn = state.capturedThisTurn || captured;
 
   // ─── Ranking & game-end logic ─────────────────────────────────────────
   // The game ends as soon as the second-last player finishes (only one
@@ -748,10 +811,11 @@ function processMove(room, token) {
   const shouldEndGame = finishedOrder.length >= state.players.length - 1;
   const winner = shouldEndGame ? (finishedOrder[0] || null) : null;
 
-  const extraFromDice = state.earnedExtraTurn;
-  const extraFromCapture = captured && state.options.extraTurnOnCapture;
-  const extraFromEntry = enteredBoard && state.options.extraRollOnEntry;
-  const anyExtraTurn = extraFromDice || extraFromCapture || extraFromEntry;
+  // Capture/entry bonuses happen AFTER a move, so they can't be pre-rolled.
+  // Track the reason so it survives a multi-dice move phase.
+  let pendingBonusReason = state.pendingBonusReason;
+  if (captured && state.options.extraTurnOnCapture) pendingBonusReason = 'captured';
+  else if (enteredBoard && state.options.extraRollOnEntry) pendingBonusReason = 'entered board';
 
   const newPendingDice = [...state.pendingDice];
   newPendingDice.splice(diceIndex, 1);
@@ -766,8 +830,22 @@ function processMove(room, token) {
   state.tokens = newTokens;
   state.captureCounts = newCaptureCounts;
   state.finishedOrder = finishedOrder;
+  state.pendingBonusReason = pendingBonusReason;
+  state.capturedThisTurn = capturedThisTurn;
 
   if (newPendingDice.length === 0) {
+    // ─── Missed-capture penalty ─────────────────────────────────────────
+    // A capture is no longer forced. If the player ends the turn without
+    // capturing, any of their OWN pieces that could have captured (when the
+    // move phase began) and are still on the board are sent home.
+    const penalty = capturedThisTurn
+      ? { tokens: state.tokens, removedCount: 0 }
+      : applyMissedCapturePenalty(state.tokens, cp, state.missedCaptureTargets);
+    state.tokens = penalty.tokens;
+    state.missedCaptureTargets = [];
+    state.capturedThisTurn = false;
+    const missedMessage = formatMissedCaptureMessage(cp, penalty.removedCount);
+
     if (winner) {
       // Build final ranking: everyone who finished (1st, 2nd, …) + the
       // single remaining player (last place).
@@ -817,6 +895,9 @@ function processMove(room, token) {
           if (u) u.roomId = null;
         }
       }
+      // The room is gone, so tell connected clients to tear down their
+      // peer-to-peer voice sessions.
+      io.to(room.id).emit('voice-reset', {});
       rooms.delete(room.id);
       broadcastOnlineUsers();
       return;
@@ -839,27 +920,25 @@ function processMove(room, token) {
         diceValues: [],
         diceRolled: false,
         currentPlayerIndex: npi,
-        earnedExtraTurn: false,
+        pendingExtraRoll: false,
+        pendingBonusReason: '',
         consecutiveSixes: 0,
         rollHasSix: false,
         turnSnapshot: state.tokens.map(t => ({ ...t })),
-        message: `🎉 ${capitalize(cp)} finished in ${suffix} place! ${capitalize(nextPlayer)}'s turn - Roll the dice!`,
+        message: `🎉 ${capitalize(cp)} finished in ${suffix} place! ${capitalize(nextPlayer)}'s turn - Roll the dice!${missedMessage ? ' ' + missedMessage : ''}`,
       });
       saveGameRecord(room);
       return;
     }
-    if (anyExtraTurn) {
-      const reasons = [];
-      if (extraFromDice) reasons.push(state.options.diceCount === 1 ? 'rolled 6' : 'double 6');
-      if (extraFromCapture) reasons.push('captured');
-      if (extraFromEntry) reasons.push('entered board');
+    if (pendingBonusReason) {
       Object.assign(state, {
         pendingDice: [],
         selectedDiceIndex: null,
         diceValues: [],
         diceRolled: false,
-        earnedExtraTurn: false,
-        message: `${capitalize(cp)} gets another turn! (${reasons.join(' & ')})`,
+        pendingExtraRoll: false,
+        pendingBonusReason: '',
+        message: `${capitalize(cp)} gets another turn! (${pendingBonusReason})${missedMessage ? ' ' + missedMessage : ''}`,
       });
       saveGameRecord(room);
       return;
@@ -876,20 +955,21 @@ function processMove(room, token) {
       diceValues: [],
       diceRolled: false,
       currentPlayerIndex: npi,
-      earnedExtraTurn: false,
+      pendingExtraRoll: false,
+      pendingBonusReason: '',
       consecutiveSixes: 0,
       rollHasSix: false,
       turnSnapshot: state.tokens.map(t => ({ ...t })),
-      message: `${capitalize(state.players[npi])}'s turn - Roll the dice!`,
+      message: `${capitalize(state.players[npi])}'s turn - Roll the dice!${missedMessage ? ' ' + missedMessage : ''}`,
     });
   } else {
     Object.assign(state, {
       pendingDice: newPendingDice,
       selectedDiceIndex: newPendingDice.length === 1 ? 0 : null,
-      earnedExtraTurn: anyExtraTurn,
+      pendingBonusReason,
       message: (newPendingDice.length === 1
         ? `Tap a token to move ${newPendingDice[0]} steps.`
-        : 'Select a die, then tap a token.') + penaltyMessage,
+        : 'Select a die, then tap a token.'),
     });
   }
 
@@ -1017,6 +1097,7 @@ io.on('connection', (socket) => {
       paused: false,
       vacantSlots: [],
       pendingReplacements: {},
+      voiceUsers: {},
     });
     user.roomId = roomId;
     socket.join(roomId);
@@ -1132,6 +1213,10 @@ io.on('connection', (socket) => {
     room.players = room.players.filter(p => p !== user.username);
     delete room.playerColors[user.username];
     delete room.playerSockets[user.username];
+    if (room.voiceUsers && room.voiceUsers[user.username]) {
+      delete room.voiceUsers[user.username];
+      emitVoiceUsers(room);
+    }
     user.roomId = null;
     socket.leave(roomId);
 
@@ -1250,6 +1335,57 @@ io.on('connection', (socket) => {
     emitGameState(room);
   });
 
+  // ─── Voice chat signaling (WebRTC peer-to-peer) ─────────────────────────
+  // The audio stream never touches this server — it only relays SDP offers,
+  // answers and ICE candidates between players in the same room, and keeps a
+  // room-local list of who is in voice chat.
+
+  socket.on('voice-join', ({ roomId }) => {
+    const room = rooms.get(roomId);
+    if (!room) return;
+    const user = users.get(socket.id);
+    if (!user || !room.players.includes(user.username)) return;
+    room.voiceUsers = room.voiceUsers || {};
+    room.voiceUsers[user.username] = { muted: false, deafened: false };
+    emitVoiceUsers(room);
+  });
+
+  socket.on('voice-leave', ({ roomId }) => {
+    const room = rooms.get(roomId);
+    if (!room) return;
+    const user = users.get(socket.id);
+    if (!user) return;
+    room.voiceUsers = room.voiceUsers || {};
+    if (room.voiceUsers[user.username]) {
+      delete room.voiceUsers[user.username];
+      emitVoiceUsers(room);
+    }
+  });
+
+  socket.on('voice-state', ({ roomId, muted, deafened }) => {
+    const room = rooms.get(roomId);
+    if (!room) return;
+    const user = users.get(socket.id);
+    if (!user) return;
+    room.voiceUsers = room.voiceUsers || {};
+    if (room.voiceUsers[user.username]) {
+      room.voiceUsers[user.username].muted = !!muted;
+      room.voiceUsers[user.username].deafened = !!deafened;
+      emitVoiceUsers(room);
+    }
+  });
+
+  socket.on('voice-signal', ({ roomId, to, signal }) => {
+    const room = rooms.get(roomId);
+    if (!room) return;
+    const user = users.get(socket.id);
+    if (!user) return;
+    if (!signal || typeof to !== 'string') return;
+    const targetSid = findSocketByUsername(to);
+    if (!targetSid) return;
+    io.to(targetSid).emit('voice-signal', { from: user.username, signal });
+  });
+
   socket.on('continue-without-player', ({ roomId, playerName }) => {
     const room = rooms.get(roomId);
     if (!room || !room.gameState) return;
@@ -1287,6 +1423,10 @@ io.on('connection', (socket) => {
     if (user.roomId) {
       const room = rooms.get(user.roomId);
       if (room) {
+        if (room.voiceUsers && room.voiceUsers[user.username]) {
+          delete room.voiceUsers[user.username];
+          emitVoiceUsers(room);
+        }
         if (room.started) {
           const color = room.playerColors[user.username];
           if (color) {

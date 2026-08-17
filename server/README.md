@@ -32,3 +32,13 @@ PORT=8080 npm start
 - Room-based game sessions
 - Player invitation system
 - Automatic reconnection support
+- In-game voice chat (WebRTC peer-to-peer; the server only relays signaling)
+
+## Voice chat
+
+Voice runs as a WebRTC full mesh between the players in a room — the audio
+never passes through this server, which only relays SDP offers/answers and ICE
+candidates over the existing Socket.IO connection. STUN is used for most
+connections, with a free public TURN fallback (Open Relay) for players behind
+strict NATs. To use your own TURN credentials, edit the `ICE_SERVERS` constant
+in `src/voice.ts`.
