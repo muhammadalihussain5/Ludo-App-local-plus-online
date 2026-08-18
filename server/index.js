@@ -113,10 +113,11 @@ function moveWouldCapture(tokens, token, diceValue) {
 }
 
 // Every distinct total reachable by using any non-empty subset of pendingDice.
-// In two-dice "choose" mode the player only ever uses one die of the pair, so
-// only the individual values are reachable there.
-function getReachableTotals(pendingDice, options) {
-  if (options && options.diceCount === 2 && options.twoDiceMode === 'choose') {
+// In two-dice "choose" mode the unused die is normally discarded, so only
+// individual values are reachable — unless the roll contains a 6, in which
+// case both dice must be used (same as "both" mode).
+function getReachableTotals(pendingDice, options, rollHasSix) {
+  if (options && options.diceCount === 2 && options.twoDiceMode === 'choose' && !rollHasSix) {
     return [...new Set(pendingDice)];
   }
   const counts = new Map();
@@ -139,8 +140,8 @@ function getReachableTotals(pendingDice, options) {
 // The PLAYER's OWN tokens that could capture an opponent this turn using any
 // reachable total from pendingDice. Safe squares and home-base pieces are
 // excluded by moveWouldCapture.
-function getCapturableOwnTokens(tokens, player, pendingDice, options) {
-  const totals = getReachableTotals(pendingDice, options);
+function getCapturableOwnTokens(tokens, player, pendingDice, options, rollHasSix) {
+  const totals = getReachableTotals(pendingDice, options, rollHasSix);
   return tokens
     .filter(t => t.player === player)
     .filter(t => totals.some(total => moveWouldCapture(tokens, t, total)));
@@ -722,7 +723,7 @@ function processRoll(room, diceValues) {
   // No more bonus rolls: the player moves with the full accumulated pool.
   const anyValid = getValidMovesForAnyDice(state.tokens, player, pendingDice, state.captureCounts);
   const hasValidMoves = anyValid.length > 0;
-  const captureTargets = getCapturableOwnTokens(state.tokens, player, pendingDice, state.options)
+  const captureTargets = getCapturableOwnTokens(state.tokens, player, pendingDice, state.options, hasSix)
     .map(t => `${t.player}-${t.id}`);
 
   let message = state.options.diceCount === 1
@@ -1466,7 +1467,15 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => {
-  console.log(`\n🎲 Ludo Server running on port ${PORT}`);
-  console.log(`   Connect clients to: http://localhost:${PORT}\n`);
-});
+if (require.main === module) {
+  server.listen(PORT, () => {
+    console.log(`\n🎲 Ludo Server running on port ${PORT}`);
+    console.log(`   Connect clients to: http://localhost:${PORT}\n`);
+  });
+}
+
+module.exports = {
+  getReachableTotals,
+  getCapturableOwnTokens,
+  moveWouldCapture,
+};
