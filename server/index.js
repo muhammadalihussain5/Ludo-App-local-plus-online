@@ -112,36 +112,148 @@ function moveWouldCapture(tokens, token, diceValue) {
   );
 }
 
-// Every distinct total reachable by using any non-empty subset of pendingDice.
-// In two-dice "choose" mode the unused die is normally discarded, so only
-// individual values are reachable — unless the roll contains a 6, in which
-// case both dice must be used (same as "both" mode).
-function getReachableTotals(pendingDice, options, rollHasSix) {
-  if (options && options.diceCount === 2 && options.twoDiceMode === 'choose' && !rollHasSix) {
-    return [...new Set(pendingDice)];
+function isChooseOneMode(options) {
+  return !!(options && options.diceCount === 2 && options.twoDiceMode === 'choose');
+}
+
+function inferDiceGroups(pendingDice, options, rollHasSixFlag, existing) {
+  const dice = pendingDice || [];
+  if (existing && Array.isArray(existing.groupIds) && existing.groupIds.length === dice.length && existing.mustUse) {
+    return { groupIds: existing.groupIds.slice(), mustUse: { ...existing.mustUse } };
   }
-  const counts = new Map();
-  for (const dv of pendingDice) counts.set(dv, (counts.get(dv) || 0) + 1);
-  const unique = [...counts.keys()];
-  const totals = new Set();
-  const rec = (i, sum) => {
-    if (i === unique.length) {
-      if (sum > 0) totals.add(sum);
-      return;
+  if (dice.length === 0) return { groupIds: [], mustUse: {} };
+
+  const groupIds = [];
+  const mustUse = {};
+
+  if (!isChooseOneMode(options)) {
+    mustUse[0] = true;
+    for (let i = 0; i < dice.length; i++) groupIds.push(0);
+    return { groupIds, mustUse };
+  }
+
+  if (dice.length === 4) {
+    groupIds.push(0, 0, 1, 1);
+    mustUse[0] = dice[0] === 6 || dice[1] === 6;
+    mustUse[1] = dice[2] === 6 || dice[3] === 6;
+    return { groupIds, mustUse };
+  }
+
+  if (dice.length === 3) {
+    const sixCount = dice.filter(v => v === 6).length;
+    if (sixCount >= 2) {
+      mustUse[0] = true;
+      groupIds.push(0, 0, 0);
+    } else if (sixCount === 1) {
+      const sixIdx = dice.indexOf(6);
+      for (let i = 0; i < 3; i++) groupIds.push(i === sixIdx ? 0 : 1);
+      mustUse[0] = true;
+      mustUse[1] = false;
+    } else {
+      mustUse[0] = false;
+      groupIds.push(0, 0, 0);
     }
-    const value = unique[i];
-    const max = counts.get(value);
-    for (let k = 0; k <= max; k++) rec(i + 1, sum + value * k);
-  };
-  rec(0, 0);
+    return { groupIds, mustUse };
+  }
+
+  if (dice.length === 2) {
+    groupIds.push(0, 0);
+    mustUse[0] = dice[0] === 6 || dice[1] === 6 || !!rollHasSixFlag;
+    return { groupIds, mustUse };
+  }
+
+  groupIds.push(0);
+  mustUse[0] = true;
+  return { groupIds, mustUse };
+}
+
+function nextDiceGroupId(groupIds) {
+  return groupIds && groupIds.length ? Math.max(...groupIds) + 1 : 0;
+}
+
+function consumePendingDie(pendingDice, groupIds, mustUse, diceIndex, options) {
+  const info = inferDiceGroups(pendingDice, options, undefined, { groupIds, mustUse });
+  const nextDice = pendingDice.slice();
+  const nextIds = info.groupIds.slice();
+  const gid = nextIds[diceIndex];
+  nextDice.splice(diceIndex, 1);
+  nextIds.splice(diceIndex, 1);
+
+  if (isChooseOneMode(options) && info.mustUse[gid] === false) {
+    for (let i = nextDice.length - 1; i >= 0; i--) {
+      if (nextIds[i] === gid) {
+        nextDice.splice(i, 1);
+        nextIds.splice(i, 1);
+      }
+    }
+  }
+  return { pendingDice: nextDice, groupIds: nextIds };
+}
+
+function describePendingDicePlay(pendingDice, options, groupInfo) {
+  if (pendingDice.length <= 1) return ' Tap a token to move.';
+  if (!isChooseOneMode(options)) return ' Select a die, then tap a token.';
+  const info = groupInfo || inferDiceGroups(pendingDice, options);
+  const sixCount = pendingDice.filter(v => v === 6).length;
+  const optionalCount = pendingDice.filter((_, i) => info.mustUse[info.groupIds[i]] === false).length;
+  if (optionalCount === 0) return ' Play all dice.';
+  if (sixCount > 0 && optionalCount > 1) {
+    return ` Play every 6 and choose one of the other ${optionalCount} dice.`;
+  }
+  if (optionalCount === pendingDice.length) return ' Choose one die, then tap a token.';
+  return ' Select a die, then tap a token.';
+}
+
+function subsetSumsIncludingZero(values) {
+  const totals = new Set([0]);
+  for (const v of values) {
+    const current = [...totals];
+    for (const t of current) totals.add(t + v);
+  }
+  return [...totals];
+}
+
+// Every distinct total reachable with a legal combination of pendingDice.
+// Choose-one mode: a six-free roll contributes at most one die; a roll that
+// contains a 6 must be fully used. Extra rolls after a double 6 keep that
+// rule per pair (both 6s mandatory; follow-up pair is choose-one or all).
+function getReachableTotals(pendingDice, options, rollHasSixFlag, groupInfo) {
+  if (!pendingDice || pendingDice.length === 0) return [];
+  const info = inferDiceGroups(pendingDice, options, rollHasSixFlag, groupInfo);
+
+  const byGroup = new Map();
+  for (let i = 0; i < pendingDice.length; i++) {
+    const gid = info.groupIds[i] ?? 0;
+    const list = byGroup.get(gid);
+    if (list) list.push(pendingDice[i]);
+    else byGroup.set(gid, [pendingDice[i]]);
+  }
+
+  let totals = new Set([0]);
+  for (const [gid, values] of byGroup) {
+    const next = new Set();
+    if (info.mustUse[gid] === false) {
+      for (const t of totals) {
+        next.add(t);
+        for (const v of values) next.add(t + v);
+      }
+    } else {
+      const sums = subsetSumsIncludingZero(values);
+      for (const t of totals) {
+        for (const s of sums) next.add(t + s);
+      }
+    }
+    totals = next;
+  }
+  totals.delete(0);
   return [...totals].sort((a, b) => a - b);
 }
 
 // The PLAYER's OWN tokens that could capture an opponent this turn using any
 // reachable total from pendingDice. Safe squares and home-base pieces are
 // excluded by moveWouldCapture.
-function getCapturableOwnTokens(tokens, player, pendingDice, options, rollHasSix) {
-  const totals = getReachableTotals(pendingDice, options, rollHasSix);
+function getCapturableOwnTokens(tokens, player, pendingDice, options, rollHasSixFlag, groupInfo) {
+  const totals = getReachableTotals(pendingDice, options, rollHasSixFlag, groupInfo);
   return tokens
     .filter(t => t.player === player)
     .filter(t => totals.some(total => moveWouldCapture(tokens, t, total)));
@@ -260,6 +372,8 @@ function createInitialState(players, options, gameId = crypto.randomUUID()) {
     tokens,
     diceValues: [],
     pendingDice: [],
+    pendingDiceGroupIds: [],
+    diceGroupMustUse: {},
     selectedDiceIndex: null,
     diceRolled: false,
     winner: null,
@@ -294,6 +408,14 @@ function normalizeGameState(state) {
     missedCaptureTargets: Array.isArray(state.missedCaptureTargets) ? state.missedCaptureTargets.slice() : [],
     capturedThisTurn: !!state.capturedThisTurn,
   };
+  const groups = inferDiceGroups(
+    normalized.pendingDice || [],
+    normalized.options,
+    normalized.rollHasSix,
+    { groupIds: state.pendingDiceGroupIds, mustUse: state.diceGroupMustUse },
+  );
+  normalized.pendingDiceGroupIds = groups.groupIds;
+  normalized.diceGroupMustUse = groups.mustUse;
   delete normalized.earnedExtraTurn;
   return normalized;
 }
@@ -325,6 +447,8 @@ function removeColorFromGameState(state, color) {
     diceRolled: false,
     diceValues: [],
     pendingDice: [],
+    pendingDiceGroupIds: [],
+    diceGroupMustUse: {},
     selectedDiceIndex: null,
     pendingExtraRoll: false,
     pendingBonusReason: '',
@@ -680,6 +804,8 @@ function processRoll(room, diceValues) {
       diceRolled: false,
       diceValues: [],
       pendingDice: [],
+      pendingDiceGroupIds: [],
+      diceGroupMustUse: {},
       selectedDiceIndex: null,
       currentPlayerIndex: npi,
       pendingExtraRoll: false,
@@ -700,6 +826,11 @@ function processRoll(room, diceValues) {
   // Accumulate this roll onto the pool from earlier bonus rolls.
   const pendingDice = [...state.pendingDice, ...diceValues];
   const newDiceValues = [...state.pendingDice, ...diceValues];
+  const groupId = nextDiceGroupId(state.pendingDiceGroupIds || []);
+  const groupMustUse = !isChooseOneMode(state.options) || hasSix;
+  const newGroupIds = [...(state.pendingDiceGroupIds || []), ...diceValues.map(() => groupId)];
+  const newMustUse = { ...(state.diceGroupMustUse || {}), [groupId]: groupMustUse };
+  const groupInfo = { groupIds: newGroupIds, mustUse: newMustUse };
 
   // If this roll earns another roll, keep rolling BEFORE moving.
   const extraFromDice = shouldGetExtraTurnFromDice(state.options, diceValues);
@@ -707,6 +838,8 @@ function processRoll(room, diceValues) {
     Object.assign(state, {
       diceValues: newDiceValues,
       pendingDice,
+      pendingDiceGroupIds: newGroupIds,
+      diceGroupMustUse: newMustUse,
       selectedDiceIndex: null,
       diceRolled: false,
       pendingExtraRoll: true,
@@ -723,19 +856,20 @@ function processRoll(room, diceValues) {
   // No more bonus rolls: the player moves with the full accumulated pool.
   const anyValid = getValidMovesForAnyDice(state.tokens, player, pendingDice, state.captureCounts);
   const hasValidMoves = anyValid.length > 0;
-  const captureTargets = getCapturableOwnTokens(state.tokens, player, pendingDice, state.options, hasSix)
+  const captureTargets = getCapturableOwnTokens(state.tokens, player, pendingDice, state.options, hasSix, groupInfo)
     .map(t => `${t.player}-${t.id}`);
 
   let message = state.options.diceCount === 1
     ? `${capitalize(player)} rolled a ${diceValues[0]}!`
     : `${capitalize(player)} rolled ${diceValues[0]} & ${diceValues[1]}!`;
   if (!hasValidMoves) message += ' No valid moves.';
-  else if (pendingDice.length === 1) message += ' Tap a token to move.';
-  else message += ' Select a die, then tap a token.';
+  else message += describePendingDicePlay(pendingDice, state.options, groupInfo);
 
   Object.assign(state, {
     diceValues: newDiceValues,
     pendingDice,
+    pendingDiceGroupIds: newGroupIds,
+    diceGroupMustUse: newMustUse,
     selectedDiceIndex: pendingDice.length === 1 ? 0 : null,
     diceRolled: true,
     pendingExtraRoll: false,
@@ -752,6 +886,8 @@ function processRoll(room, diceValues) {
       diceRolled: false,
       diceValues: [],
       pendingDice: [],
+      pendingDiceGroupIds: [],
+      diceGroupMustUse: {},
       selectedDiceIndex: null,
       currentPlayerIndex: npi,
       consecutiveSixes: 0,
@@ -818,14 +954,21 @@ function processMove(room, token) {
   if (captured && state.options.extraTurnOnCapture) pendingBonusReason = 'captured';
   else if (enteredBoard && state.options.extraRollOnEntry) pendingBonusReason = 'entered board';
 
-  const newPendingDice = [...state.pendingDice];
-  newPendingDice.splice(diceIndex, 1);
-
-  const isChooseMode = state.options.diceCount === 2 && state.options.twoDiceMode === 'choose';
-  if (isChooseMode && !state.rollHasSix && newPendingDice.length > 0) newPendingDice.length = 0;
+  const consumed = consumePendingDie(
+    state.pendingDice,
+    state.pendingDiceGroupIds || [],
+    state.diceGroupMustUse || {},
+    diceIndex,
+    state.options,
+  );
+  const newPendingDice = consumed.pendingDice;
+  let newGroupIds = consumed.groupIds;
 
   if (newPendingDice.length > 0) {
-    if (getValidMovesForAnyDice(newTokens, cp, newPendingDice, newCaptureCounts).length === 0) newPendingDice.length = 0;
+    if (getValidMovesForAnyDice(newTokens, cp, newPendingDice, newCaptureCounts).length === 0) {
+      newPendingDice.length = 0;
+      newGroupIds = [];
+    }
   }
 
   state.tokens = newTokens;
@@ -855,6 +998,8 @@ function processMove(room, token) {
       const rankingText = ranking.map((p, i) => `${i + 1}. ${capitalize(p)}`).join(' • ');
       Object.assign(state, {
         pendingDice: [],
+        pendingDiceGroupIds: [],
+        diceGroupMustUse: {},
         selectedDiceIndex: null,
         diceRolled: false,
         diceValues: [],
@@ -917,6 +1062,8 @@ function processMove(room, token) {
       const nextPlayer = state.players[npi];
       Object.assign(state, {
         pendingDice: [],
+        pendingDiceGroupIds: [],
+        diceGroupMustUse: {},
         selectedDiceIndex: null,
         diceValues: [],
         diceRolled: false,
@@ -934,6 +1081,8 @@ function processMove(room, token) {
     if (pendingBonusReason) {
       Object.assign(state, {
         pendingDice: [],
+        pendingDiceGroupIds: [],
+        diceGroupMustUse: {},
         selectedDiceIndex: null,
         diceValues: [],
         diceRolled: false,
@@ -952,6 +1101,8 @@ function processMove(room, token) {
     }
     Object.assign(state, {
       pendingDice: [],
+      pendingDiceGroupIds: [],
+      diceGroupMustUse: {},
       selectedDiceIndex: null,
       diceValues: [],
       diceRolled: false,
@@ -966,11 +1117,10 @@ function processMove(room, token) {
   } else {
     Object.assign(state, {
       pendingDice: newPendingDice,
+      pendingDiceGroupIds: newGroupIds,
       selectedDiceIndex: newPendingDice.length === 1 ? 0 : null,
       pendingBonusReason,
-      message: (newPendingDice.length === 1
-        ? `Tap a token to move ${newPendingDice[0]} steps.`
-        : 'Select a die, then tap a token.'),
+      message: describePendingDicePlay(newPendingDice, state.options, { groupIds: newGroupIds, mustUse: state.diceGroupMustUse || {} }).trim(),
     });
   }
 
@@ -1478,4 +1628,6 @@ module.exports = {
   getReachableTotals,
   getCapturableOwnTokens,
   moveWouldCapture,
+  inferDiceGroups,
+  consumePendingDie,
 };
