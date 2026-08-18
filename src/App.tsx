@@ -1358,7 +1358,7 @@ export default function App() {
           // No more bonus rolls: the player moves with the full accumulated pool.
           const anyValid = getValidMovesForAnyDice(prev.tokens, player, newPendingDice, prev.captureCounts);
           const hasValidMoves = anyValid.length > 0;
-          const captureTargets = getCapturableOwnTokens(prev.tokens, player, newPendingDice, prev.options)
+          const captureTargets = getCapturableOwnTokens(prev.tokens, player, newPendingDice, prev.options, hasSix)
             .map(t => `${t.player}-${t.id}`);
           let message = prev.options.diceCount === 1 ? `${capitalize(player)} rolled a ${finalValues[0]}!` : `${capitalize(player)} rolled ${finalValues[0]} & ${finalValues[1]}!`;
           if (!hasValidMoves) message += ' No valid moves.';

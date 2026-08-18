@@ -278,11 +278,14 @@ export function moveWouldCapture(tokens: Token[], token: Token, diceValue: numbe
 
 // Enumerate every distinct total a piece can reach by using any non-empty
 // subset of `pendingDice`. Since applying dice in any order produces the same
-// final total, subset sums cover all combinations/sequences. In two-dice
-// "choose" mode the player only ever uses one die of the pair (the other is
-// discarded), so only the individual die values are reachable there.
-export function getReachableTotals(pendingDice: number[], options?: GameOptions): number[] {
-  if (options && options.diceCount === 2 && options.twoDiceMode === 'choose') {
+// final total, subset sums cover all combinations/sequences.
+//
+// In two-dice "choose" mode the unused die is normally discarded, so only
+// individual values are reachable — UNLESS the roll contains a 6, in which
+// case both dice must be used (same as "both" mode). Pass `rollHasSix` so
+// detection matches that override.
+export function getReachableTotals(pendingDice: number[], options?: GameOptions, rollHasSix?: boolean): number[] {
+  if (options && options.diceCount === 2 && options.twoDiceMode === 'choose' && !rollHasSix) {
     return [...new Set(pendingDice)];
   }
   const counts = new Map<number, number>();
@@ -311,8 +314,9 @@ export function getCapturableOwnTokens(
   player: PlayerColor,
   pendingDice: number[],
   options?: GameOptions,
+  rollHasSix?: boolean,
 ): Token[] {
-  const totals = getReachableTotals(pendingDice, options);
+  const totals = getReachableTotals(pendingDice, options, rollHasSix);
   return tokens
     .filter(t => t.player === player)
     .filter(t => totals.some(total => moveWouldCapture(tokens, t, total)));
