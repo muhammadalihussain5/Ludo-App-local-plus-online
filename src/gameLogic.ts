@@ -21,6 +21,12 @@ export interface GameState {
   tokens: Token[];
   diceValues: number[];
   pendingDice: number[];
+  // Parallel to pendingDice: dice from the same roll share a group id so
+  // choose-one mode can discard only the unused sibling of that roll.
+  pendingDiceGroupIds: number[];
+  // groupId -> true if every remaining die in that group must be played
+  // (the roll contained a 6, or the mode is not choose-one).
+  diceGroupMustUse: Record<number, boolean>;
   selectedDiceIndex: number | null;
   diceRolled: boolean;
   // Winner is set only when the game actually ends (the second-last player finishes)
@@ -276,32 +282,190 @@ export function moveWouldCapture(tokens: Token[], token: Token, diceValue: numbe
 //      (e.g. move d1 then d2 — the final square is the same as moving d1+d2),
 // including the larger accumulated pools produced by bonus re-rolls.
 
-// Enumerate every distinct total a piece can reach by using any non-empty
-// subset of `pendingDice`. Since applying dice in any order produces the same
-// final total, subset sums cover all combinations/sequences.
+export function isChooseOneMode(options?: GameOptions): boolean {
+  return !!options && options.diceCount === 2 && options.twoDiceMode === 'choose';
+}
+
+export interface DiceGroupInfo {
+  groupIds: number[];
+  mustUse: Record<number, boolean>;
+}
+
+function emptyDiceGroups(): DiceGroupInfo {
+  return { groupIds: [], mustUse: {} };
+}
+
+// Rebuild (or trust) per-roll groups so choose-one mode can require every 6
+// while still letting the player pick one die from a six-free pair.
 //
-// In two-dice "choose" mode the unused die is normally discarded, so only
-// individual values are reachable — UNLESS the roll contains a 6, in which
-// case both dice must be used (same as "both" mode). Pass `rollHasSix` so
-// detection matches that override.
-export function getReachableTotals(pendingDice: number[], options?: GameOptions, rollHasSix?: boolean): number[] {
-  if (options && options.diceCount === 2 && options.twoDiceMode === 'choose' && !rollHasSix) {
-    return [...new Set(pendingDice)];
+// After a double 6 the pool is four dice. Correct choose-one play:
+//   • 2 sixes (double 6 + a six-free pair) → play both 6s and choose one of the other two
+//   • 3 sixes (double 6 + a pair that contains a 6) → play all four
+// 1-die and 2-dice "both" modes always treat every die as mandatory.
+export function inferDiceGroups(
+  pendingDice: number[],
+  options?: GameOptions,
+  rollHasSixFlag?: boolean,
+  existing?: { groupIds?: number[]; mustUse?: Record<number, boolean> },
+): DiceGroupInfo {
+  if (
+    existing?.groupIds &&
+    existing.groupIds.length === pendingDice.length &&
+    existing.mustUse
+  ) {
+    return { groupIds: existing.groupIds.slice(), mustUse: { ...existing.mustUse } };
   }
-  const counts = new Map<number, number>();
-  for (const dv of pendingDice) counts.set(dv, (counts.get(dv) ?? 0) + 1);
-  const unique = [...counts.keys()];
-  const totals = new Set<number>();
-  const rec = (i: number, sum: number) => {
-    if (i === unique.length) {
-      if (sum > 0) totals.add(sum);
-      return;
+
+  if (pendingDice.length === 0) return emptyDiceGroups();
+
+  const groupIds: number[] = [];
+  const mustUse: Record<number, boolean> = {};
+
+  if (!isChooseOneMode(options)) {
+    mustUse[0] = true;
+    for (let i = 0; i < pendingDice.length; i++) groupIds.push(0);
+    return { groupIds, mustUse };
+  }
+
+  if (pendingDice.length === 4) {
+    groupIds.push(0, 0, 1, 1);
+    mustUse[0] = pendingDice[0] === 6 || pendingDice[1] === 6;
+    mustUse[1] = pendingDice[2] === 6 || pendingDice[3] === 6;
+    return { groupIds, mustUse };
+  }
+
+  if (pendingDice.length === 3) {
+    const sixCount = pendingDice.filter(v => v === 6).length;
+    if (sixCount >= 2) {
+      // Leftover from a 3-six / all-mandatory pool.
+      mustUse[0] = true;
+      groupIds.push(0, 0, 0);
+    } else if (sixCount === 1) {
+      // Used one 6 from [6,6,a,b]; remaining 6 is mandatory, the pair is optional.
+      const sixIdx = pendingDice.indexOf(6);
+      for (let i = 0; i < 3; i++) groupIds.push(i === sixIdx ? 0 : 1);
+      mustUse[0] = true;
+      mustUse[1] = false;
+    } else {
+      mustUse[0] = false;
+      groupIds.push(0, 0, 0);
     }
-    const value = unique[i];
-    const max = counts.get(value)!;
-    for (let k = 0; k <= max; k++) rec(i + 1, sum + value * k);
-  };
-  rec(0, 0);
+    return { groupIds, mustUse };
+  }
+
+  if (pendingDice.length === 2) {
+    groupIds.push(0, 0);
+    mustUse[0] = pendingDice[0] === 6 || pendingDice[1] === 6 || !!rollHasSixFlag;
+    return { groupIds, mustUse };
+  }
+
+  groupIds.push(0);
+  mustUse[0] = true;
+  return { groupIds, mustUse };
+}
+
+export function nextDiceGroupId(groupIds: number[]): number {
+  return groupIds.length ? Math.max(...groupIds) + 1 : 0;
+}
+
+// After playing one pending die: drop it, and if it belonged to a choose-one
+// (no-6) pair, also discard its unused sibling. Mandatory groups (any 6, or
+// non-choose modes) keep their remaining dice.
+export function consumePendingDie(
+  pendingDice: number[],
+  groupIds: number[],
+  mustUse: Record<number, boolean>,
+  diceIndex: number,
+  options: GameOptions,
+): { pendingDice: number[]; groupIds: number[] } {
+  const info = inferDiceGroups(pendingDice, options, undefined, { groupIds, mustUse });
+  const nextDice = pendingDice.slice();
+  const nextIds = info.groupIds.slice();
+  const gid = nextIds[diceIndex];
+  nextDice.splice(diceIndex, 1);
+  nextIds.splice(diceIndex, 1);
+
+  if (isChooseOneMode(options) && info.mustUse[gid] === false) {
+    for (let i = nextDice.length - 1; i >= 0; i--) {
+      if (nextIds[i] === gid) {
+        nextDice.splice(i, 1);
+        nextIds.splice(i, 1);
+      }
+    }
+  }
+  return { pendingDice: nextDice, groupIds: nextIds };
+}
+
+export function describePendingDicePlay(
+  pendingDice: number[],
+  options: GameOptions,
+  groupInfo?: DiceGroupInfo,
+): string {
+  if (pendingDice.length <= 1) return ' Tap a token to move.';
+  if (!isChooseOneMode(options)) return ' Select a die, then tap a token.';
+  const info = groupInfo ?? inferDiceGroups(pendingDice, options);
+  const sixCount = pendingDice.filter(v => v === 6).length;
+  const optionalCount = pendingDice.filter((_, i) => info.mustUse[info.groupIds[i]] === false).length;
+  if (optionalCount === 0) return ' Play all dice.';
+  if (sixCount > 0 && optionalCount > 1) {
+    return ` Play every 6 and choose one of the other ${optionalCount} dice.`;
+  }
+  if (optionalCount === pendingDice.length) return ' Choose one die, then tap a token.';
+  return ' Select a die, then tap a token.';
+}
+
+function subsetSumsIncludingZero(values: number[]): number[] {
+  const totals = new Set<number>([0]);
+  for (const v of values) {
+    const current = [...totals];
+    for (const t of current) totals.add(t + v);
+  }
+  return [...totals];
+}
+
+// Enumerate every distinct total a piece can reach with a legal combination
+// of `pendingDice`. Applying dice in any order produces the same final total,
+// so subset sums cover sequences.
+//
+// In two-dice "choose" mode a six-free roll contributes at most one die
+// (the unused sibling is discarded). A roll that contains a 6 must be fully
+// used, same as "both" mode. Extra rolls after a double 6 keep that rule
+// per pair: both 6s are mandatory, and the follow-up pair is either
+// choose-one (no 6) or fully mandatory (has a 6).
+export function getReachableTotals(
+  pendingDice: number[],
+  options?: GameOptions,
+  rollHasSixFlag?: boolean,
+  groupInfo?: DiceGroupInfo,
+): number[] {
+  if (pendingDice.length === 0) return [];
+  const info = inferDiceGroups(pendingDice, options, rollHasSixFlag, groupInfo);
+
+  const byGroup = new Map<number, number[]>();
+  for (let i = 0; i < pendingDice.length; i++) {
+    const gid = info.groupIds[i] ?? 0;
+    const list = byGroup.get(gid);
+    if (list) list.push(pendingDice[i]);
+    else byGroup.set(gid, [pendingDice[i]]);
+  }
+
+  let totals = new Set<number>([0]);
+  for (const [gid, values] of byGroup) {
+    const next = new Set<number>();
+    if (info.mustUse[gid] === false) {
+      for (const t of totals) {
+        next.add(t);
+        for (const v of values) next.add(t + v);
+      }
+    } else {
+      const sums = subsetSumsIncludingZero(values);
+      for (const t of totals) {
+        for (const s of sums) next.add(t + s);
+      }
+    }
+    totals = next;
+  }
+  totals.delete(0);
   return [...totals].sort((a, b) => a - b);
 }
 
@@ -314,9 +478,10 @@ export function getCapturableOwnTokens(
   player: PlayerColor,
   pendingDice: number[],
   options?: GameOptions,
-  rollHasSix?: boolean,
+  rollHasSixFlag?: boolean,
+  groupInfo?: DiceGroupInfo,
 ): Token[] {
-  const totals = getReachableTotals(pendingDice, options, rollHasSix);
+  const totals = getReachableTotals(pendingDice, options, rollHasSixFlag, groupInfo);
   return tokens
     .filter(t => t.player === player)
     .filter(t => totals.some(total => moveWouldCapture(tokens, t, total)));
@@ -483,6 +648,8 @@ export function createInitialState(players: PlayerColor[], options: GameOptions)
     tokens,
     diceValues: [],
     pendingDice: [],
+    pendingDiceGroupIds: [],
+    diceGroupMustUse: {},
     selectedDiceIndex: null,
     diceRolled: false,
     winner: null,

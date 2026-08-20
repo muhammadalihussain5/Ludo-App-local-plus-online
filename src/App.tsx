@@ -9,6 +9,7 @@ import {
   getAIMove, getAIMoveTwoDice,
   getCapturableOwnTokens, applyMissedCapturePenalty, formatMissedCaptureMessage, moveWouldCapture,
   registerFinishedPlayer, hasPlayerFinished,
+  consumePendingDie, inferDiceGroups, nextDiceGroupId, describePendingDicePlay, isChooseOneMode,
 } from './gameLogic';
 import { useVoiceChat, type VoiceChatApi } from './voice';
 import { VoicePanel } from './VoicePanel';
@@ -108,6 +109,14 @@ function normalizeGameState(state: GameState): GameState {
     missedCaptureTargets: Array.isArray(state.missedCaptureTargets) ? [...state.missedCaptureTargets] : [],
     capturedThisTurn: !!state.capturedThisTurn,
   };
+  const groups = inferDiceGroups(
+    normalized.pendingDice || [],
+    normalized.options,
+    normalized.rollHasSix,
+    { groupIds: state.pendingDiceGroupIds, mustUse: state.diceGroupMustUse },
+  );
+  normalized.pendingDiceGroupIds = groups.groupIds;
+  normalized.diceGroupMustUse = groups.mustUse;
   delete (normalized as GameState & { earnedExtraTurn?: boolean }).earnedExtraTurn;
   return normalized;
 }
@@ -340,7 +349,7 @@ function OptionsScreen({ onStart, onBack }: { onStart: (o: GameOptions, pc: numb
             <button onClick={() => setOptions(o => ({...o, twoDiceMode: 'choose'}))} className={`py-2.5 rounded-xl text-sm font-medium transition-all ${options.twoDiceMode === 'choose' ? 'bg-amber-500 text-white shadow-lg' : 'bg-white/10 text-white/60'}`}>Choose One<div className="text-xs opacity-70 mt-0.5">Pick which die to use</div></button>
           </div></div>}
           <div className="bg-white/5 rounded-xl p-3 text-xs text-white/50 space-y-1">
-            {options.diceCount === 1 ? (<><p>• Roll a <span className="text-amber-400 font-bold">6</span> to bring a piece out & get extra turn</p><p>• <span className="text-red-400 font-bold">3 consecutive 6s</span> reverses your turn!</p></>) : (<><p>• If <span className="text-amber-400 font-bold">any die shows 6</span>, use both dice values</p><p>• <span className="text-amber-400 font-bold">Double 6</span> gives extra turn</p><p>• <span className="text-red-400 font-bold">2 consecutive double 6s</span> reverses your turn!</p></>)}
+            {options.diceCount === 1 ? (<><p>• Roll a <span className="text-amber-400 font-bold">6</span> to bring a piece out & get extra turn</p><p>• Extra 6s accumulate first — <span className="text-amber-400 font-bold">play every die</span> in the pool</p><p>• <span className="text-red-400 font-bold">3 consecutive 6s</span> reverses your turn!</p></>) : options.twoDiceMode === 'choose' ? (<><p>• No 6: <span className="text-amber-400 font-bold">choose one</span> die. Any 6: use <span className="text-amber-400 font-bold">both</span> dice from that roll</p><p>• <span className="text-amber-400 font-bold">Double 6</span> extra roll: play every 6. If the next pair has no 6, also choose one of those two; if it has a 6, play all four</p><p>• <span className="text-red-400 font-bold">2 consecutive double 6s</span> reverses your turn!</p></>) : (<><p>• Use <span className="text-amber-400 font-bold">both</span> dice from every roll — extra 6s accumulate and all must be played</p><p>• <span className="text-amber-400 font-bold">Double 6</span> gives extra turn</p><p>• <span className="text-red-400 font-bold">2 consecutive double 6s</span> reverses your turn!</p></>)}
           </div>
         </div>
         <div className="flex gap-3">
@@ -1071,7 +1080,7 @@ function GameBoard({ gameState, boardSize, myColor, isOnline, isRolling, onToken
       <div className="w-full max-w-md mx-auto px-4 pb-4 pt-2">
         <div className="flex items-center justify-center gap-4">
           <div className="flex flex-col items-center gap-2">
-            <div className="flex gap-2">
+            <div className="flex max-w-[18rem] flex-wrap justify-center gap-2">
               {gameState.diceValues.length > 0 ? gameState.diceValues.map((dv, i) => {
                 const isUsed = usedDiceIndices.has(i);
                 const isSelected = gameState.selectedDiceIndex !== null && gameState.pendingDice[gameState.selectedDiceIndex] === dv && !isUsed;
@@ -1289,7 +1298,7 @@ export default function App() {
     const finished = prev.finishedOrder || [];
     let npi = overrideIndex !== undefined ? overrideIndex : (prev.currentPlayerIndex + 1) % prev.players.length;
     if (prev.winner) {
-      return { ...prev, diceRolled: false, diceValues: [], pendingDice: [], selectedDiceIndex: null, pendingExtraRoll: false, pendingBonusReason: '', missedCaptureTargets: [], capturedThisTurn: false, consecutiveSixes: 0, rollHasSix: false, isTransitioning: false };
+      return { ...prev, diceRolled: false, diceValues: [], pendingDice: [], pendingDiceGroupIds: [], diceGroupMustUse: {}, selectedDiceIndex: null, pendingExtraRoll: false, pendingBonusReason: '', missedCaptureTargets: [], capturedThisTurn: false, consecutiveSixes: 0, rollHasSix: false, isTransitioning: false };
     }
     if (finished.length > 0) {
       let safety = prev.players.length;
@@ -1298,11 +1307,11 @@ export default function App() {
       }
     }
     const np = prev.players[npi];
-    return { ...prev, diceRolled: false, diceValues: [], pendingDice: [], selectedDiceIndex: null, currentPlayerIndex: npi, pendingExtraRoll: false, pendingBonusReason: '', missedCaptureTargets: [], capturedThisTurn: false, consecutiveSixes: 0, rollHasSix: false, message: `${capitalize(np)}'s turn - Roll the dice!`, isTransitioning: !prev.options.isAIMode && prev.players.length > 1, turnSnapshot: prev.tokens.map(t => ({ ...t })) };
+    return { ...prev, diceRolled: false, diceValues: [], pendingDice: [], pendingDiceGroupIds: [], diceGroupMustUse: {}, selectedDiceIndex: null, currentPlayerIndex: npi, pendingExtraRoll: false, pendingBonusReason: '', missedCaptureTargets: [], capturedThisTurn: false, consecutiveSixes: 0, rollHasSix: false, message: `${capitalize(np)}'s turn - Roll the dice!`, isTransitioning: !prev.options.isAIMode && prev.players.length > 1, turnSnapshot: prev.tokens.map(t => ({ ...t })) };
   }, []);
 
   const startExtraTurn = useCallback((prev: GameState, reason: string): GameState => {
-    return { ...prev, diceRolled: false, diceValues: [], pendingDice: [], selectedDiceIndex: null, pendingExtraRoll: false, pendingBonusReason: '', missedCaptureTargets: [], capturedThisTurn: false, message: `${capitalize(getCurrentPlayer(prev))} gets another turn! (${reason})` };
+    return { ...prev, diceRolled: false, diceValues: [], pendingDice: [], pendingDiceGroupIds: [], diceGroupMustUse: {}, selectedDiceIndex: null, pendingExtraRoll: false, pendingBonusReason: '', missedCaptureTargets: [], capturedThisTurn: false, message: `${capitalize(getCurrentPlayer(prev))} gets another turn! (${reason})` };
   }, []);
 
   const rollDice = useCallback(() => {
@@ -1336,6 +1345,14 @@ export default function App() {
           // Accumulate this roll's dice onto the pool from earlier bonus rolls.
           const newPendingDice = [...prev.pendingDice, ...finalValues];
           const newDiceValues = [...prev.pendingDice, ...finalValues];
+          const groupId = nextDiceGroupId(prev.pendingDiceGroupIds || []);
+          // Choose-one: a six-free pair is optional (pick one). Any 6 in the
+          // pair — including double 6 — makes the whole pair mandatory.
+          // 1-die and use-both modes always require every die.
+          const groupMustUse = !isChooseOneMode(prev.options) || hasSix;
+          const newGroupIds = [...(prev.pendingDiceGroupIds || []), ...finalValues.map(() => groupId)];
+          const newMustUse = { ...(prev.diceGroupMustUse || {}), [groupId]: groupMustUse };
+          const groupInfo = { groupIds: newGroupIds, mustUse: newMustUse };
 
           // If this roll earns another roll, keep rolling BEFORE moving.
           const extraFromDice = shouldGetExtraTurnFromDice(prev.options, finalValues);
@@ -1344,6 +1361,8 @@ export default function App() {
               ...prev,
               diceValues: newDiceValues,
               pendingDice: newPendingDice,
+              pendingDiceGroupIds: newGroupIds,
+              diceGroupMustUse: newMustUse,
               selectedDiceIndex: null,
               diceRolled: false,
               pendingExtraRoll: true,
@@ -1358,13 +1377,12 @@ export default function App() {
           // No more bonus rolls: the player moves with the full accumulated pool.
           const anyValid = getValidMovesForAnyDice(prev.tokens, player, newPendingDice, prev.captureCounts);
           const hasValidMoves = anyValid.length > 0;
-          const captureTargets = getCapturableOwnTokens(prev.tokens, player, newPendingDice, prev.options, hasSix)
+          const captureTargets = getCapturableOwnTokens(prev.tokens, player, newPendingDice, prev.options, hasSix, groupInfo)
             .map(t => `${t.player}-${t.id}`);
           let message = prev.options.diceCount === 1 ? `${capitalize(player)} rolled a ${finalValues[0]}!` : `${capitalize(player)} rolled ${finalValues[0]} & ${finalValues[1]}!`;
           if (!hasValidMoves) message += ' No valid moves.';
-          else if (newPendingDice.length === 1) message += ' Tap a token to move.';
-          else message += ' Select a die, then tap a token.';
-          return { ...prev, diceValues: newDiceValues, pendingDice: newPendingDice, selectedDiceIndex: newPendingDice.length === 1 ? 0 : null, diceRolled: true, pendingExtraRoll: false, consecutiveSixes: newConsecutiveSixes, rollHasSix: hasSix, missedCaptureTargets: captureTargets, capturedThisTurn: false, message };
+          else message += describePendingDicePlay(newPendingDice, prev.options, groupInfo);
+          return { ...prev, diceValues: newDiceValues, pendingDice: newPendingDice, pendingDiceGroupIds: newGroupIds, diceGroupMustUse: newMustUse, selectedDiceIndex: newPendingDice.length === 1 ? 0 : null, diceRolled: true, pendingExtraRoll: false, consecutiveSixes: newConsecutiveSixes, rollHasSix: hasSix, missedCaptureTargets: captureTargets, capturedThisTurn: false, message };
         });
         setIsRolling(false); rollingRef.current = false;
       }
@@ -1423,10 +1441,19 @@ export default function App() {
       if (captured && prev.options.extraTurnOnCapture) pendingBonusReason = 'captured';
       else if (enteredBoard && prev.options.extraRollOnEntry) pendingBonusReason = 'entered board';
 
-      const newPendingDice = [...prev.pendingDice]; newPendingDice.splice(diceIndex, 1);
-      const isChooseMode = prev.options.diceCount === 2 && prev.options.twoDiceMode === 'choose';
-      if (isChooseMode && !prev.rollHasSix && newPendingDice.length > 0) newPendingDice.length = 0;
-      if (newPendingDice.length > 0 && getValidMovesForAnyDice(newTokens, cp, newPendingDice, newCaptureCounts).length === 0) newPendingDice.length = 0;
+      const consumed = consumePendingDie(
+        prev.pendingDice,
+        prev.pendingDiceGroupIds || [],
+        prev.diceGroupMustUse || {},
+        diceIndex,
+        prev.options,
+      );
+      const newPendingDice = consumed.pendingDice;
+      let newGroupIds = consumed.groupIds;
+      if (newPendingDice.length > 0 && getValidMovesForAnyDice(newTokens, cp, newPendingDice, newCaptureCounts).length === 0) {
+        newPendingDice.length = 0;
+        newGroupIds = [];
+      }
       const updated = { ...prev, tokens: newTokens, captureCounts: newCaptureCounts, finishedOrder, capturedThisTurn };
       if (newPendingDice.length === 0) {
         // ─── Missed-capture penalty ───────────────────────────────────────
@@ -1446,24 +1473,25 @@ export default function App() {
           const remaining = prev.players.filter(p => !finishedOrder.includes(p));
           const ranking = [...finishedOrder, ...remaining];
           const rankingText = ranking.map((p, i) => `${i + 1}. ${capitalize(p)}`).join(' • ');
-          return { ...finalUpdated, pendingDice: [], selectedDiceIndex: null, diceRolled: false, diceValues: [], winner, message: `🏆 Game over! ${rankingText}` };
+          return { ...finalUpdated, pendingDice: [], pendingDiceGroupIds: [], diceGroupMustUse: {}, selectedDiceIndex: null, diceRolled: false, diceValues: [], winner, message: `🏆 Game over! ${rankingText}` };
         }
         if (playerFinished && !shouldEndGame) {
           // Mark the player's finish in the message and let the game continue
           // for the remaining players.
           const place = finishedOrder.length; // 1, 2, ...
           const suffix = ['1st', '2nd', '3rd', '4th'][place - 1] ?? `${place}th`;
-          const nextState = transitionToNextPlayer({ ...finalUpdated, pendingDice: [], selectedDiceIndex: null, diceValues: [], diceRolled: false });
+          const nextState = transitionToNextPlayer({ ...finalUpdated, pendingDice: [], pendingDiceGroupIds: [], diceGroupMustUse: {}, selectedDiceIndex: null, diceValues: [], diceRolled: false });
           return { ...nextState, message: `🎉 ${capitalize(cp)} finished in ${suffix} place! ${nextState.message}${missedMessage ? ' ' + missedMessage : ''}` };
         }
         if (pendingBonusReason) {
-          const bonusState = startExtraTurn({ ...finalUpdated, pendingDice: [], selectedDiceIndex: null, diceValues: [], diceRolled: false, pendingBonusReason: '' }, pendingBonusReason);
+          const bonusState = startExtraTurn({ ...finalUpdated, pendingDice: [], pendingDiceGroupIds: [], diceGroupMustUse: {}, selectedDiceIndex: null, diceValues: [], diceRolled: false, pendingBonusReason: '' }, pendingBonusReason);
           return { ...bonusState, message: bonusState.message + (missedMessage ? ' ' + missedMessage : '') };
         }
-        const nextState = transitionToNextPlayer({ ...finalUpdated, pendingDice: [], selectedDiceIndex: null, diceValues: [], diceRolled: false });
+        const nextState = transitionToNextPlayer({ ...finalUpdated, pendingDice: [], pendingDiceGroupIds: [], diceGroupMustUse: {}, selectedDiceIndex: null, diceValues: [], diceRolled: false });
         return { ...nextState, message: nextState.message + (missedMessage ? ' ' + missedMessage : '') };
       }
-      return { ...updated, pendingDice: newPendingDice, selectedDiceIndex: newPendingDice.length === 1 ? 0 : null, pendingBonusReason, message: (newPendingDice.length === 1 ? `Tap a token to move ${newPendingDice[0]} steps.` : 'Select a die, then tap a token.') };
+      const remainInfo = { groupIds: newGroupIds, mustUse: prev.diceGroupMustUse || {} };
+      return { ...updated, pendingDice: newPendingDice, pendingDiceGroupIds: newGroupIds, selectedDiceIndex: newPendingDice.length === 1 ? 0 : null, pendingBonusReason, message: describePendingDicePlay(newPendingDice, prev.options, remainInfo).trim() };
     });
   }, [transitionToNextPlayer, startExtraTurn]);
 

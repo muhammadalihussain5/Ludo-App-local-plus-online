@@ -1,0 +1,1038 @@
+diff --git a/server/index.js b/server/index.js
+index b7ca142..f4eec5c 100644
+--- a/server/index.js
++++ b/server/index.js
+@@ -112,36 +112,148 @@ function moveWouldCapture(tokens, token, diceValue) {
+   );
+ }
+ 
+-// Every distinct total reachable by using any non-empty subset of pendingDice.
+-// In two-dice "choose" mode the unused die is normally discarded, so only
+-// individual values are reachable — unless the roll contains a 6, in which
+-// case both dice must be used (same as "both" mode).
+-function getReachableTotals(pendingDice, options, rollHasSix) {
+-  if (options && options.diceCount === 2 && options.twoDiceMode === 'choose' && !rollHasSix) {
+-    return [...new Set(pendingDice)];
++function isChooseOneMode(options) {
++  return !!(options && options.diceCount === 2 && options.twoDiceMode === 'choose');
++}
++
++function inferDiceGroups(pendingDice, options, rollHasSixFlag, existing) {
++  const dice = pendingDice || [];
++  if (existing && Array.isArray(existing.groupIds) && existing.groupIds.length === dice.length && existing.mustUse) {
++    return { groupIds: existing.groupIds.slice(), mustUse: { ...existing.mustUse } };
+   }
+-  const counts = new Map();
+-  for (const dv of pendingDice) counts.set(dv, (counts.get(dv) || 0) + 1);
+-  const unique = [...counts.keys()];
+-  const totals = new Set();
+-  const rec = (i, sum) => {
+-    if (i === unique.length) {
+-      if (sum > 0) totals.add(sum);
+-      return;
++  if (dice.length === 0) return { groupIds: [], mustUse: {} };
++
++  const groupIds = [];
++  const mustUse = {};
++
++  if (!isChooseOneMode(options)) {
++    mustUse[0] = true;
++    for (let i = 0; i < dice.length; i++) groupIds.push(0);
++    return { groupIds, mustUse };
++  }
++
++  if (dice.length === 4) {
++    groupIds.push(0, 0, 1, 1);
++    mustUse[0] = dice[0] === 6 || dice[1] === 6;
++    mustUse[1] = dice[2] === 6 || dice[3] === 6;
++    return { groupIds, mustUse };
++  }
++
++  if (dice.length === 3) {
++    const sixCount = dice.filter(v => v === 6).length;
++    if (sixCount >= 2) {
++      mustUse[0] = true;
++      groupIds.push(0, 0, 0);
++    } else if (sixCount === 1) {
++      const sixIdx = dice.indexOf(6);
++      for (let i = 0; i < 3; i++) groupIds.push(i === sixIdx ? 0 : 1);
++      mustUse[0] = true;
++      mustUse[1] = false;
++    } else {
++      mustUse[0] = false;
++      groupIds.push(0, 0, 0);
+     }
+-    const value = unique[i];
+-    const max = counts.get(value);
+-    for (let k = 0; k <= max; k++) rec(i + 1, sum + value * k);
+-  };
+-  rec(0, 0);
++    return { groupIds, mustUse };
++  }
++
++  if (dice.length === 2) {
++    groupIds.push(0, 0);
++    mustUse[0] = dice[0] === 6 || dice[1] === 6 || !!rollHasSixFlag;
++    return { groupIds, mustUse };
++  }
++
++  groupIds.push(0);
++  mustUse[0] = true;
++  return { groupIds, mustUse };
++}
++
++function nextDiceGroupId(groupIds) {
++  return groupIds && groupIds.length ? Math.max(...groupIds) + 1 : 0;
++}
++
++function consumePendingDie(pendingDice, groupIds, mustUse, diceIndex, options) {
++  const info = inferDiceGroups(pendingDice, options, undefined, { groupIds, mustUse });
++  const nextDice = pendingDice.slice();
++  const nextIds = info.groupIds.slice();
++  const gid = nextIds[diceIndex];
++  nextDice.splice(diceIndex, 1);
++  nextIds.splice(diceIndex, 1);
++
++  if (isChooseOneMode(options) && info.mustUse[gid] === false) {
++    for (let i = nextDice.length - 1; i >= 0; i--) {
++      if (nextIds[i] === gid) {
++        nextDice.splice(i, 1);
++        nextIds.splice(i, 1);
++      }
++    }
++  }
++  return { pendingDice: nextDice, groupIds: nextIds };
++}
++
++function describePendingDicePlay(pendingDice, options, groupInfo) {
++  if (pendingDice.length <= 1) return ' Tap a token to move.';
++  if (!isChooseOneMode(options)) return ' Select a die, then tap a token.';
++  const info = groupInfo || inferDiceGroups(pendingDice, options);
++  const sixCount = pendingDice.filter(v => v === 6).length;
++  const optionalCount = pendingDice.filter((_, i) => info.mustUse[info.groupIds[i]] === false).length;
++  if (optionalCount === 0) return ' Play all dice.';
++  if (sixCount > 0 && optionalCount > 1) {
++    return ` Play every 6 and choose one of the other ${optionalCount} dice.`;
++  }
++  if (optionalCount === pendingDice.length) return ' Choose one die, then tap a token.';
++  return ' Select a die, then tap a token.';
++}
++
++function subsetSumsIncludingZero(values) {
++  const totals = new Set([0]);
++  for (const v of values) {
++    const current = [...totals];
++    for (const t of current) totals.add(t + v);
++  }
++  return [...totals];
++}
++
++// Every distinct total reachable with a legal combination of pendingDice.
++// Choose-one mode: a six-free roll contributes at most one die; a roll that
++// contains a 6 must be fully used. Extra rolls after a double 6 keep that
++// rule per pair (both 6s mandatory; follow-up pair is choose-one or all).
++function getReachableTotals(pendingDice, options, rollHasSixFlag, groupInfo) {
++  if (!pendingDice || pendingDice.length === 0) return [];
++  const info = inferDiceGroups(pendingDice, options, rollHasSixFlag, groupInfo);
++
++  const byGroup = new Map();
++  for (let i = 0; i < pendingDice.length; i++) {
++    const gid = info.groupIds[i] ?? 0;
++    const list = byGroup.get(gid);
++    if (list) list.push(pendingDice[i]);
++    else byGroup.set(gid, [pendingDice[i]]);
++  }
++
++  let totals = new Set([0]);
++  for (const [gid, values] of byGroup) {
++    const next = new Set();
++    if (info.mustUse[gid] === false) {
++      for (const t of totals) {
++        next.add(t);
++        for (const v of values) next.add(t + v);
++      }
++    } else {
++      const sums = subsetSumsIncludingZero(values);
++      for (const t of totals) {
++        for (const s of sums) next.add(t + s);
++      }
++    }
++    totals = next;
++  }
++  totals.delete(0);
+   return [...totals].sort((a, b) => a - b);
+ }
+ 
+ // The PLAYER's OWN tokens that could capture an opponent this turn using any
+ // reachable total from pendingDice. Safe squares and home-base pieces are
+ // excluded by moveWouldCapture.
+-function getCapturableOwnTokens(tokens, player, pendingDice, options, rollHasSix) {
+-  const totals = getReachableTotals(pendingDice, options, rollHasSix);
++function getCapturableOwnTokens(tokens, player, pendingDice, options, rollHasSixFlag, groupInfo) {
++  const totals = getReachableTotals(pendingDice, options, rollHasSixFlag, groupInfo);
+   return tokens
+     .filter(t => t.player === player)
+     .filter(t => totals.some(total => moveWouldCapture(tokens, t, total)));
+@@ -260,6 +372,8 @@ function createInitialState(players, options, gameId = crypto.randomUUID()) {
+     tokens,
+     diceValues: [],
+     pendingDice: [],
++    pendingDiceGroupIds: [],
++    diceGroupMustUse: {},
+     selectedDiceIndex: null,
+     diceRolled: false,
+     winner: null,
+@@ -294,6 +408,14 @@ function normalizeGameState(state) {
+     missedCaptureTargets: Array.isArray(state.missedCaptureTargets) ? state.missedCaptureTargets.slice() : [],
+     capturedThisTurn: !!state.capturedThisTurn,
+   };
++  const groups = inferDiceGroups(
++    normalized.pendingDice || [],
++    normalized.options,
++    normalized.rollHasSix,
++    { groupIds: state.pendingDiceGroupIds, mustUse: state.diceGroupMustUse },
++  );
++  normalized.pendingDiceGroupIds = groups.groupIds;
++  normalized.diceGroupMustUse = groups.mustUse;
+   delete normalized.earnedExtraTurn;
+   return normalized;
+ }
+@@ -325,6 +447,8 @@ function removeColorFromGameState(state, color) {
+     diceRolled: false,
+     diceValues: [],
+     pendingDice: [],
++    pendingDiceGroupIds: [],
++    diceGroupMustUse: {},
+     selectedDiceIndex: null,
+     pendingExtraRoll: false,
+     pendingBonusReason: '',
+@@ -680,6 +804,8 @@ function processRoll(room, diceValues) {
+       diceRolled: false,
+       diceValues: [],
+       pendingDice: [],
++      pendingDiceGroupIds: [],
++      diceGroupMustUse: {},
+       selectedDiceIndex: null,
+       currentPlayerIndex: npi,
+       pendingExtraRoll: false,
+@@ -700,6 +826,11 @@ function processRoll(room, diceValues) {
+   // Accumulate this roll onto the pool from earlier bonus rolls.
+   const pendingDice = [...state.pendingDice, ...diceValues];
+   const newDiceValues = [...state.pendingDice, ...diceValues];
++  const groupId = nextDiceGroupId(state.pendingDiceGroupIds || []);
++  const groupMustUse = !isChooseOneMode(state.options) || hasSix;
++  const newGroupIds = [...(state.pendingDiceGroupIds || []), ...diceValues.map(() => groupId)];
++  const newMustUse = { ...(state.diceGroupMustUse || {}), [groupId]: groupMustUse };
++  const groupInfo = { groupIds: newGroupIds, mustUse: newMustUse };
+ 
+   // If this roll earns another roll, keep rolling BEFORE moving.
+   const extraFromDice = shouldGetExtraTurnFromDice(state.options, diceValues);
+@@ -707,6 +838,8 @@ function processRoll(room, diceValues) {
+     Object.assign(state, {
+       diceValues: newDiceValues,
+       pendingDice,
++      pendingDiceGroupIds: newGroupIds,
++      diceGroupMustUse: newMustUse,
+       selectedDiceIndex: null,
+       diceRolled: false,
+       pendingExtraRoll: true,
+@@ -723,19 +856,20 @@ function processRoll(room, diceValues) {
+   // No more bonus rolls: the player moves with the full accumulated pool.
+   const anyValid = getValidMovesForAnyDice(state.tokens, player, pendingDice, state.captureCounts);
+   const hasValidMoves = anyValid.length > 0;
+-  const captureTargets = getCapturableOwnTokens(state.tokens, player, pendingDice, state.options, hasSix)
++  const captureTargets = getCapturableOwnTokens(state.tokens, player, pendingDice, state.options, hasSix, groupInfo)
+     .map(t => `${t.player}-${t.id}`);
+ 
+   let message = state.options.diceCount === 1
+     ? `${capitalize(player)} rolled a ${diceValues[0]}!`
+     : `${capitalize(player)} rolled ${diceValues[0]} & ${diceValues[1]}!`;
+   if (!hasValidMoves) message += ' No valid moves.';
+-  else if (pendingDice.length === 1) message += ' Tap a token to move.';
+-  else message += ' Select a die, then tap a token.';
++  else message += describePendingDicePlay(pendingDice, state.options, groupInfo);
+ 
+   Object.assign(state, {
+     diceValues: newDiceValues,
+     pendingDice,
++    pendingDiceGroupIds: newGroupIds,
++    diceGroupMustUse: newMustUse,
+     selectedDiceIndex: pendingDice.length === 1 ? 0 : null,
+     diceRolled: true,
+     pendingExtraRoll: false,
+@@ -752,6 +886,8 @@ function processRoll(room, diceValues) {
+       diceRolled: false,
+       diceValues: [],
+       pendingDice: [],
++      pendingDiceGroupIds: [],
++      diceGroupMustUse: {},
+       selectedDiceIndex: null,
+       currentPlayerIndex: npi,
+       consecutiveSixes: 0,
+@@ -818,14 +954,21 @@ function processMove(room, token) {
+   if (captured && state.options.extraTurnOnCapture) pendingBonusReason = 'captured';
+   else if (enteredBoard && state.options.extraRollOnEntry) pendingBonusReason = 'entered board';
+ 
+-  const newPendingDice = [...state.pendingDice];
+-  newPendingDice.splice(diceIndex, 1);
+-
+-  const isChooseMode = state.options.diceCount === 2 && state.options.twoDiceMode === 'choose';
+-  if (isChooseMode && !state.rollHasSix && newPendingDice.length > 0) newPendingDice.length = 0;
++  const consumed = consumePendingDie(
++    state.pendingDice,
++    state.pendingDiceGroupIds || [],
++    state.diceGroupMustUse || {},
++    diceIndex,
++    state.options,
++  );
++  const newPendingDice = consumed.pendingDice;
++  let newGroupIds = consumed.groupIds;
+ 
+   if (newPendingDice.length > 0) {
+-    if (getValidMovesForAnyDice(newTokens, cp, newPendingDice, newCaptureCounts).length === 0) newPendingDice.length = 0;
++    if (getValidMovesForAnyDice(newTokens, cp, newPendingDice, newCaptureCounts).length === 0) {
++      newPendingDice.length = 0;
++      newGroupIds = [];
++    }
+   }
+ 
+   state.tokens = newTokens;
+@@ -855,6 +998,8 @@ function processMove(room, token) {
+       const rankingText = ranking.map((p, i) => `${i + 1}. ${capitalize(p)}`).join(' • ');
+       Object.assign(state, {
+         pendingDice: [],
++        pendingDiceGroupIds: [],
++        diceGroupMustUse: {},
+         selectedDiceIndex: null,
+         diceRolled: false,
+         diceValues: [],
+@@ -917,6 +1062,8 @@ function processMove(room, token) {
+       const nextPlayer = state.players[npi];
+       Object.assign(state, {
+         pendingDice: [],
++        pendingDiceGroupIds: [],
++        diceGroupMustUse: {},
+         selectedDiceIndex: null,
+         diceValues: [],
+         diceRolled: false,
+@@ -934,6 +1081,8 @@ function processMove(room, token) {
+     if (pendingBonusReason) {
+       Object.assign(state, {
+         pendingDice: [],
++        pendingDiceGroupIds: [],
++        diceGroupMustUse: {},
+         selectedDiceIndex: null,
+         diceValues: [],
+         diceRolled: false,
+@@ -952,6 +1101,8 @@ function processMove(room, token) {
+     }
+     Object.assign(state, {
+       pendingDice: [],
++      pendingDiceGroupIds: [],
++      diceGroupMustUse: {},
+       selectedDiceIndex: null,
+       diceValues: [],
+       diceRolled: false,
+@@ -966,11 +1117,10 @@ function processMove(room, token) {
+   } else {
+     Object.assign(state, {
+       pendingDice: newPendingDice,
++      pendingDiceGroupIds: newGroupIds,
+       selectedDiceIndex: newPendingDice.length === 1 ? 0 : null,
+       pendingBonusReason,
+-      message: (newPendingDice.length === 1
+-        ? `Tap a token to move ${newPendingDice[0]} steps.`
+-        : 'Select a die, then tap a token.'),
++      message: describePendingDicePlay(newPendingDice, state.options, { groupIds: newGroupIds, mustUse: state.diceGroupMustUse || {} }).trim(),
+     });
+   }
+ 
+@@ -1478,4 +1628,6 @@ module.exports = {
+   getReachableTotals,
+   getCapturableOwnTokens,
+   moveWouldCapture,
++  inferDiceGroups,
++  consumePendingDie,
+ };
+diff --git a/src/App.tsx b/src/App.tsx
+index 3b98344..b22721c 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -9,6 +9,7 @@ import {
+   getAIMove, getAIMoveTwoDice,
+   getCapturableOwnTokens, applyMissedCapturePenalty, formatMissedCaptureMessage, moveWouldCapture,
+   registerFinishedPlayer, hasPlayerFinished,
++  consumePendingDie, inferDiceGroups, nextDiceGroupId, describePendingDicePlay, isChooseOneMode,
+ } from './gameLogic';
+ import { useVoiceChat, type VoiceChatApi } from './voice';
+ import { VoicePanel } from './VoicePanel';
+@@ -108,6 +109,14 @@ function normalizeGameState(state: GameState): GameState {
+     missedCaptureTargets: Array.isArray(state.missedCaptureTargets) ? [...state.missedCaptureTargets] : [],
+     capturedThisTurn: !!state.capturedThisTurn,
+   };
++  const groups = inferDiceGroups(
++    normalized.pendingDice || [],
++    normalized.options,
++    normalized.rollHasSix,
++    { groupIds: state.pendingDiceGroupIds, mustUse: state.diceGroupMustUse },
++  );
++  normalized.pendingDiceGroupIds = groups.groupIds;
++  normalized.diceGroupMustUse = groups.mustUse;
+   delete (normalized as GameState & { earnedExtraTurn?: boolean }).earnedExtraTurn;
+   return normalized;
+ }
+@@ -340,7 +349,7 @@ function OptionsScreen({ onStart, onBack }: { onStart: (o: GameOptions, pc: numb
+             <button onClick={() => setOptions(o => ({...o, twoDiceMode: 'choose'}))} className={`py-2.5 rounded-xl text-sm font-medium transition-all ${options.twoDiceMode === 'choose' ? 'bg-amber-500 text-white shadow-lg' : 'bg-white/10 text-white/60'}`}>Choose One<div className="text-xs opacity-70 mt-0.5">Pick which die to use</div></button>
+           </div></div>}
+           <div className="bg-white/5 rounded-xl p-3 text-xs text-white/50 space-y-1">
+-            {options.diceCount === 1 ? (<><p>• Roll a <span className="text-amber-400 font-bold">6</span> to bring a piece out & get extra turn</p><p>• <span className="text-red-400 font-bold">3 consecutive 6s</span> reverses your turn!</p></>) : (<><p>• If <span className="text-amber-400 font-bold">any die shows 6</span>, use both dice values</p><p>• <span className="text-amber-400 font-bold">Double 6</span> gives extra turn</p><p>• <span className="text-red-400 font-bold">2 consecutive double 6s</span> reverses your turn!</p></>)}
++            {options.diceCount === 1 ? (<><p>• Roll a <span className="text-amber-400 font-bold">6</span> to bring a piece out & get extra turn</p><p>• Extra 6s accumulate first — <span className="text-amber-400 font-bold">play every die</span> in the pool</p><p>• <span className="text-red-400 font-bold">3 consecutive 6s</span> reverses your turn!</p></>) : options.twoDiceMode === 'choose' ? (<><p>• No 6: <span className="text-amber-400 font-bold">choose one</span> die. Any 6: use <span className="text-amber-400 font-bold">both</span> dice from that roll</p><p>• <span className="text-amber-400 font-bold">Double 6</span> extra roll: play every 6. If the next pair has no 6, also choose one of those two; if it has a 6, play all four</p><p>• <span className="text-red-400 font-bold">2 consecutive double 6s</span> reverses your turn!</p></>) : (<><p>• Use <span className="text-amber-400 font-bold">both</span> dice from every roll — extra 6s accumulate and all must be played</p><p>• <span className="text-amber-400 font-bold">Double 6</span> gives extra turn</p><p>• <span className="text-red-400 font-bold">2 consecutive double 6s</span> reverses your turn!</p></>)}
+           </div>
+         </div>
+         <div className="flex gap-3">
+@@ -1071,7 +1080,7 @@ function GameBoard({ gameState, boardSize, myColor, isOnline, isRolling, onToken
+       <div className="w-full max-w-md mx-auto px-4 pb-4 pt-2">
+         <div className="flex items-center justify-center gap-4">
+           <div className="flex flex-col items-center gap-2">
+-            <div className="flex gap-2">
++            <div className="flex max-w-[18rem] flex-wrap justify-center gap-2">
+               {gameState.diceValues.length > 0 ? gameState.diceValues.map((dv, i) => {
+                 const isUsed = usedDiceIndices.has(i);
+                 const isSelected = gameState.selectedDiceIndex !== null && gameState.pendingDice[gameState.selectedDiceIndex] === dv && !isUsed;
+@@ -1289,7 +1298,7 @@ export default function App() {
+     const finished = prev.finishedOrder || [];
+     let npi = overrideIndex !== undefined ? overrideIndex : (prev.currentPlayerIndex + 1) % prev.players.length;
+     if (prev.winner) {
+-      return { ...prev, diceRolled: false, diceValues: [], pendingDice: [], selectedDiceIndex: null, pendingExtraRoll: false, pendingBonusReason: '', missedCaptureTargets: [], capturedThisTurn: false, consecutiveSixes: 0, rollHasSix: false, isTransitioning: false };
++      return { ...prev, diceRolled: false, diceValues: [], pendingDice: [], pendingDiceGroupIds: [], diceGroupMustUse: {}, selectedDiceIndex: null, pendingExtraRoll: false, pendingBonusReason: '', missedCaptureTargets: [], capturedThisTurn: false, consecutiveSixes: 0, rollHasSix: false, isTransitioning: false };
+     }
+     if (finished.length > 0) {
+       let safety = prev.players.length;
+@@ -1298,11 +1307,11 @@ export default function App() {
+       }
+     }
+     const np = prev.players[npi];
+-    return { ...prev, diceRolled: false, diceValues: [], pendingDice: [], selectedDiceIndex: null, currentPlayerIndex: npi, pendingExtraRoll: false, pendingBonusReason: '', missedCaptureTargets: [], capturedThisTurn: false, consecutiveSixes: 0, rollHasSix: false, message: `${capitalize(np)}'s turn - Roll the dice!`, isTransitioning: !prev.options.isAIMode && prev.players.length > 1, turnSnapshot: prev.tokens.map(t => ({ ...t })) };
++    return { ...prev, diceRolled: false, diceValues: [], pendingDice: [], pendingDiceGroupIds: [], diceGroupMustUse: {}, selectedDiceIndex: null, currentPlayerIndex: npi, pendingExtraRoll: false, pendingBonusReason: '', missedCaptureTargets: [], capturedThisTurn: false, consecutiveSixes: 0, rollHasSix: false, message: `${capitalize(np)}'s turn - Roll the dice!`, isTransitioning: !prev.options.isAIMode && prev.players.length > 1, turnSnapshot: prev.tokens.map(t => ({ ...t })) };
+   }, []);
+ 
+   const startExtraTurn = useCallback((prev: GameState, reason: string): GameState => {
+-    return { ...prev, diceRolled: false, diceValues: [], pendingDice: [], selectedDiceIndex: null, pendingExtraRoll: false, pendingBonusReason: '', missedCaptureTargets: [], capturedThisTurn: false, message: `${capitalize(getCurrentPlayer(prev))} gets another turn! (${reason})` };
++    return { ...prev, diceRolled: false, diceValues: [], pendingDice: [], pendingDiceGroupIds: [], diceGroupMustUse: {}, selectedDiceIndex: null, pendingExtraRoll: false, pendingBonusReason: '', missedCaptureTargets: [], capturedThisTurn: false, message: `${capitalize(getCurrentPlayer(prev))} gets another turn! (${reason})` };
+   }, []);
+ 
+   const rollDice = useCallback(() => {
+@@ -1336,6 +1345,14 @@ export default function App() {
+           // Accumulate this roll's dice onto the pool from earlier bonus rolls.
+           const newPendingDice = [...prev.pendingDice, ...finalValues];
+           const newDiceValues = [...prev.pendingDice, ...finalValues];
++          const groupId = nextDiceGroupId(prev.pendingDiceGroupIds || []);
++          // Choose-one: a six-free pair is optional (pick one). Any 6 in the
++          // pair — including double 6 — makes the whole pair mandatory.
++          // 1-die and use-both modes always require every die.
++          const groupMustUse = !isChooseOneMode(prev.options) || hasSix;
++          const newGroupIds = [...(prev.pendingDiceGroupIds || []), ...finalValues.map(() => groupId)];
++          const newMustUse = { ...(prev.diceGroupMustUse || {}), [groupId]: groupMustUse };
++          const groupInfo = { groupIds: newGroupIds, mustUse: newMustUse };
+ 
+           // If this roll earns another roll, keep rolling BEFORE moving.
+           const extraFromDice = shouldGetExtraTurnFromDice(prev.options, finalValues);
+@@ -1344,6 +1361,8 @@ export default function App() {
+               ...prev,
+               diceValues: newDiceValues,
+               pendingDice: newPendingDice,
++              pendingDiceGroupIds: newGroupIds,
++              diceGroupMustUse: newMustUse,
+               selectedDiceIndex: null,
+               diceRolled: false,
+               pendingExtraRoll: true,
+@@ -1358,13 +1377,12 @@ export default function App() {
+           // No more bonus rolls: the player moves with the full accumulated pool.
+           const anyValid = getValidMovesForAnyDice(prev.tokens, player, newPendingDice, prev.captureCounts);
+           const hasValidMoves = anyValid.length > 0;
+-          const captureTargets = getCapturableOwnTokens(prev.tokens, player, newPendingDice, prev.options, hasSix)
++          const captureTargets = getCapturableOwnTokens(prev.tokens, player, newPendingDice, prev.options, hasSix, groupInfo)
+             .map(t => `${t.player}-${t.id}`);
+           let message = prev.options.diceCount === 1 ? `${capitalize(player)} rolled a ${finalValues[0]}!` : `${capitalize(player)} rolled ${finalValues[0]} & ${finalValues[1]}!`;
+           if (!hasValidMoves) message += ' No valid moves.';
+-          else if (newPendingDice.length === 1) message += ' Tap a token to move.';
+-          else message += ' Select a die, then tap a token.';
+-          return { ...prev, diceValues: newDiceValues, pendingDice: newPendingDice, selectedDiceIndex: newPendingDice.length === 1 ? 0 : null, diceRolled: true, pendingExtraRoll: false, consecutiveSixes: newConsecutiveSixes, rollHasSix: hasSix, missedCaptureTargets: captureTargets, capturedThisTurn: false, message };
++          else message += describePendingDicePlay(newPendingDice, prev.options, groupInfo);
++          return { ...prev, diceValues: newDiceValues, pendingDice: newPendingDice, pendingDiceGroupIds: newGroupIds, diceGroupMustUse: newMustUse, selectedDiceIndex: newPendingDice.length === 1 ? 0 : null, diceRolled: true, pendingExtraRoll: false, consecutiveSixes: newConsecutiveSixes, rollHasSix: hasSix, missedCaptureTargets: captureTargets, capturedThisTurn: false, message };
+         });
+         setIsRolling(false); rollingRef.current = false;
+       }
+@@ -1423,10 +1441,19 @@ export default function App() {
+       if (captured && prev.options.extraTurnOnCapture) pendingBonusReason = 'captured';
+       else if (enteredBoard && prev.options.extraRollOnEntry) pendingBonusReason = 'entered board';
+ 
+-      const newPendingDice = [...prev.pendingDice]; newPendingDice.splice(diceIndex, 1);
+-      const isChooseMode = prev.options.diceCount === 2 && prev.options.twoDiceMode === 'choose';
+-      if (isChooseMode && !prev.rollHasSix && newPendingDice.length > 0) newPendingDice.length = 0;
+-      if (newPendingDice.length > 0 && getValidMovesForAnyDice(newTokens, cp, newPendingDice, newCaptureCounts).length === 0) newPendingDice.length = 0;
++      const consumed = consumePendingDie(
++        prev.pendingDice,
++        prev.pendingDiceGroupIds || [],
++        prev.diceGroupMustUse || {},
++        diceIndex,
++        prev.options,
++      );
++      const newPendingDice = consumed.pendingDice;
++      let newGroupIds = consumed.groupIds;
++      if (newPendingDice.length > 0 && getValidMovesForAnyDice(newTokens, cp, newPendingDice, newCaptureCounts).length === 0) {
++        newPendingDice.length = 0;
++        newGroupIds = [];
++      }
+       const updated = { ...prev, tokens: newTokens, captureCounts: newCaptureCounts, finishedOrder, capturedThisTurn };
+       if (newPendingDice.length === 0) {
+         // ─── Missed-capture penalty ───────────────────────────────────────
+@@ -1446,24 +1473,25 @@ export default function App() {
+           const remaining = prev.players.filter(p => !finishedOrder.includes(p));
+           const ranking = [...finishedOrder, ...remaining];
+           const rankingText = ranking.map((p, i) => `${i + 1}. ${capitalize(p)}`).join(' • ');
+-          return { ...finalUpdated, pendingDice: [], selectedDiceIndex: null, diceRolled: false, diceValues: [], winner, message: `🏆 Game over! ${rankingText}` };
++          return { ...finalUpdated, pendingDice: [], pendingDiceGroupIds: [], diceGroupMustUse: {}, selectedDiceIndex: null, diceRolled: false, diceValues: [], winner, message: `🏆 Game over! ${rankingText}` };
+         }
+         if (playerFinished && !shouldEndGame) {
+           // Mark the player's finish in the message and let the game continue
+           // for the remaining players.
+           const place = finishedOrder.length; // 1, 2, ...
+           const suffix = ['1st', '2nd', '3rd', '4th'][place - 1] ?? `${place}th`;
+-          const nextState = transitionToNextPlayer({ ...finalUpdated, pendingDice: [], selectedDiceIndex: null, diceValues: [], diceRolled: false });
++          const nextState = transitionToNextPlayer({ ...finalUpdated, pendingDice: [], pendingDiceGroupIds: [], diceGroupMustUse: {}, selectedDiceIndex: null, diceValues: [], diceRolled: false });
+           return { ...nextState, message: `🎉 ${capitalize(cp)} finished in ${suffix} place! ${nextState.message}${missedMessage ? ' ' + missedMessage : ''}` };
+         }
+         if (pendingBonusReason) {
+-          const bonusState = startExtraTurn({ ...finalUpdated, pendingDice: [], selectedDiceIndex: null, diceValues: [], diceRolled: false, pendingBonusReason: '' }, pendingBonusReason);
++          const bonusState = startExtraTurn({ ...finalUpdated, pendingDice: [], pendingDiceGroupIds: [], diceGroupMustUse: {}, selectedDiceIndex: null, diceValues: [], diceRolled: false, pendingBonusReason: '' }, pendingBonusReason);
+           return { ...bonusState, message: bonusState.message + (missedMessage ? ' ' + missedMessage : '') };
+         }
+-        const nextState = transitionToNextPlayer({ ...finalUpdated, pendingDice: [], selectedDiceIndex: null, diceValues: [], diceRolled: false });
++        const nextState = transitionToNextPlayer({ ...finalUpdated, pendingDice: [], pendingDiceGroupIds: [], diceGroupMustUse: {}, selectedDiceIndex: null, diceValues: [], diceRolled: false });
+         return { ...nextState, message: nextState.message + (missedMessage ? ' ' + missedMessage : '') };
+       }
+-      return { ...updated, pendingDice: newPendingDice, selectedDiceIndex: newPendingDice.length === 1 ? 0 : null, pendingBonusReason, message: (newPendingDice.length === 1 ? `Tap a token to move ${newPendingDice[0]} steps.` : 'Select a die, then tap a token.') };
++      const remainInfo = { groupIds: newGroupIds, mustUse: prev.diceGroupMustUse || {} };
++      return { ...updated, pendingDice: newPendingDice, pendingDiceGroupIds: newGroupIds, selectedDiceIndex: newPendingDice.length === 1 ? 0 : null, pendingBonusReason, message: describePendingDicePlay(newPendingDice, prev.options, remainInfo).trim() };
+     });
+   }, [transitionToNextPlayer, startExtraTurn]);
+ 
+diff --git a/src/VoicePanel.tsx b/src/VoicePanel.tsx
+index 4f80ca4..37ab918 100644
+--- a/src/VoicePanel.tsx
++++ b/src/VoicePanel.tsx
+@@ -1,104 +1,180 @@
++import { useEffect, useRef, useState } from 'react';
+ import type { VoiceChatApi } from './voice';
+ 
+ // Compact voice-chat controls. Used inline in the lobby room panel and as a
+-// floating card on the online game screen.
++// floating, shrinkable control on the online game screen so it never covers
++// the roll-dice button.
+ export function VoicePanel({ voice, me, floating = false }: { voice: VoiceChatApi; me: string; floating?: boolean }) {
+   const { status, error, muted, deafened, users, peerStates } = voice;
++  const [expanded, setExpanded] = useState(!floating);
++  const rootRef = useRef<HTMLDivElement>(null);
+ 
+-  const wrap = floating ? 'fixed bottom-4 right-4 z-50 w-72' : 'w-full';
+-  const card = floating
+-    ? 'rounded-2xl border border-white/20 bg-slate-900/80 p-3 shadow-xl backdrop-blur'
+-    : 'mt-3 rounded-xl border border-indigo-500/30 bg-indigo-500/10 p-3';
++  // After voice actually starts, collapse to the mic FAB so the board stays clear.
++  useEffect(() => {
++    if (floating && status === 'on') setExpanded(false);
++  }, [floating, status]);
+ 
+-  return (
+-    <div className={wrap}>
+-      <div className={card}>
+-        <div className="mb-2 flex items-center justify-between">
+-          <span className="text-sm font-bold text-white">🎙️ Voice Chat</span>
++  useEffect(() => {
++    if (!floating || !expanded) return;
++    const onPointer = (event: PointerEvent) => {
++      if (rootRef.current && !rootRef.current.contains(event.target as Node)) {
++        setExpanded(false);
++      }
++    };
++    document.addEventListener('pointerdown', onPointer);
++    return () => document.removeEventListener('pointerdown', onPointer);
++  }, [floating, expanded]);
++
++  const liveDot = status === 'on' && !muted;
++  const icon = status === 'error' ? '⚠️' : status === 'connecting' ? '⏳' : muted && status === 'on' ? '🔇' : deafened && status === 'on' ? '🙉' : '🎙️';
++  const aria = status === 'on'
++    ? (expanded ? 'Hide voice chat' : 'Open voice chat')
++    : 'Voice chat';
++
++  const menu = (
++    <>
++      <div className="mb-2 flex items-center justify-between gap-2">
++        <span className="text-sm font-bold text-white">🎙️ Voice Chat</span>
++        <div className="flex items-center gap-1.5">
+           {status === 'on' && (
+             <span className="rounded-full bg-green-500/20 px-1.5 py-0.5 text-[10px] font-semibold text-green-300">LIVE</span>
+           )}
++          {floating && (
++            <button
++              type="button"
++              onClick={() => setExpanded(false)}
++              className="rounded-md px-1.5 py-0.5 text-xs text-white/60 hover:bg-white/10 hover:text-white"
++              aria-label="Minimize voice chat"
++            >
++              ▾
++            </button>
++          )}
+         </div>
++      </div>
++
++      {status === 'off' && (
++        <button
++          onClick={voice.join}
++          className="w-full rounded-xl bg-indigo-500 py-2 text-sm font-semibold text-white transition-colors hover:bg-indigo-400"
++        >
++          Join Voice
++        </button>
++      )}
+ 
+-        {status === 'off' && (
++      {status === 'connecting' && (
++        <div className="py-2 text-center text-xs text-white/70">Requesting microphone…</div>
++      )}
++
++      {status === 'error' && (
++        <div>
++          <p className="mb-2 text-xs text-red-400">{error}</p>
+           <button
+             onClick={voice.join}
+             className="w-full rounded-xl bg-indigo-500 py-2 text-sm font-semibold text-white transition-colors hover:bg-indigo-400"
+           >
+-            Join Voice
++            Try again
+           </button>
+-        )}
+-
+-        {status === 'connecting' && (
+-          <div className="py-2 text-center text-xs text-white/70">Requesting microphone…</div>
+-        )}
+-
+-        {status === 'error' && (
+-          <div>
+-            <p className="mb-2 text-xs text-red-400">{error}</p>
+-            <button
+-              onClick={voice.join}
+-              className="w-full rounded-xl bg-indigo-500 py-2 text-sm font-semibold text-white transition-colors hover:bg-indigo-400"
+-            >
+-              Try again
+-            </button>
+-          </div>
+-        )}
++        </div>
++      )}
+ 
+-        {status === 'on' && (
+-          <div className="flex items-center gap-2">
+-            <button
+-              onClick={() => voice.setMuted(!muted)}
+-              className={`flex-1 rounded-lg px-2 py-2 text-xs font-semibold transition-colors ${
+-                muted ? 'bg-amber-500/80 text-amber-950' : 'bg-white/10 text-white hover:bg-white/20'
+-              }`}
+-            >
+-              {muted ? '🔇 Unmute' : '🎙️ Mute'}
+-            </button>
+-            <button
+-              onClick={() => voice.setDeafened(!deafened)}
+-              className={`flex-1 rounded-lg px-2 py-2 text-xs font-semibold transition-colors ${
+-                deafened ? 'bg-amber-500/80 text-amber-950' : 'bg-white/10 text-white hover:bg-white/20'
+-              }`}
+-            >
+-              {deafened ? '🔊 Undeafen' : '🙉 Deafen'}
+-            </button>
+-            <button
+-              onClick={voice.leave}
+-              className="rounded-lg bg-red-500/80 px-3 py-2 text-xs font-semibold text-white transition-colors hover:bg-red-500"
+-            >
+-              Leave
+-            </button>
+-          </div>
+-        )}
++      {status === 'on' && (
++        <div className="flex items-center gap-2">
++          <button
++            onClick={() => voice.setMuted(!muted)}
++            className={`flex-1 rounded-lg px-2 py-2 text-xs font-semibold transition-colors ${
++              muted ? 'bg-amber-500/80 text-amber-950' : 'bg-white/10 text-white hover:bg-white/20'
++            }`}
++          >
++            {muted ? '🔇 Unmute' : '🎙️ Mute'}
++          </button>
++          <button
++            onClick={() => voice.setDeafened(!deafened)}
++            className={`flex-1 rounded-lg px-2 py-2 text-xs font-semibold transition-colors ${
++              deafened ? 'bg-amber-500/80 text-amber-950' : 'bg-white/10 text-white hover:bg-white/20'
++            }`}
++          >
++            {deafened ? '🔊 Undeafen' : '🙉 Deafen'}
++          </button>
++          <button
++            onClick={voice.leave}
++            className="rounded-lg bg-red-500/80 px-3 py-2 text-xs font-semibold text-white transition-colors hover:bg-red-500"
++          >
++            Leave
++          </button>
++        </div>
++      )}
+ 
+-        {users.length > 0 && (
+-          <div className="mt-2 space-y-1">
+-            {users.map((u) => {
+-              const isMe = u.username === me;
+-              const dot = u.deafened
+-                ? 'bg-red-400'
+-                : u.muted
+-                  ? 'bg-amber-400'
+-                  : isMe
++      {users.length > 0 && (
++        <div className="mt-2 max-h-28 space-y-1 overflow-y-auto pr-0.5">
++          {users.map((u) => {
++            const isMe = u.username === me;
++            const dot = u.deafened
++              ? 'bg-red-400'
++              : u.muted
++                ? 'bg-amber-400'
++                : isMe
++                  ? 'bg-green-400'
++                  : peerStates[u.username] === 'connected'
+                     ? 'bg-green-400'
+-                    : peerStates[u.username] === 'connected'
+-                      ? 'bg-green-400'
+-                      : peerStates[u.username] === 'connecting' || peerStates[u.username] === 'new'
+-                        ? 'bg-yellow-400'
+-                        : 'bg-gray-400';
+-              return (
+-                <div key={u.username} className="flex items-center gap-2 text-xs">
+-                  <span className={`h-2 w-2 rounded-full ${dot}`} />
+-                  <span className="text-white/80">{u.username}{isMe ? ' (you)' : ''}</span>
+-                  {u.muted && <span className="text-white/40">🔇</span>}
+-                  {u.deafened && <span className="text-white/40">🙉</span>}
+-                </div>
+-              );
+-            })}
+-          </div>
+-        )}
++                    : peerStates[u.username] === 'connecting' || peerStates[u.username] === 'new'
++                      ? 'bg-yellow-400'
++                      : 'bg-gray-400';
++            return (
++              <div key={u.username} className="flex items-center gap-2 text-xs">
++                <span className={`h-2 w-2 rounded-full ${dot}`} />
++                <span className="text-white/80">{u.username}{isMe ? ' (you)' : ''}</span>
++                {u.muted && <span className="text-white/40">🔇</span>}
++                {u.deafened && <span className="text-white/40">🙉</span>}
++              </div>
++            );
++          })}
++        </div>
++      )}
++    </>
++  );
++
++  if (!floating) {
++    return (
++      <div className="w-full">
++        <div className="mt-3 rounded-xl border border-indigo-500/30 bg-indigo-500/10 p-3">
++          {menu}
++        </div>
+       </div>
++    );
++  }
++
++  // Top-right, below the header — never over the bottom roll-dice control.
++  return (
++    <div
++      ref={rootRef}
++      className="fixed z-50"
++      style={{ top: 'calc(env(safe-area-inset-top, 0px) + 3.4rem)', right: '0.5rem' }}
++    >
++      {!expanded ? (
++        <button
++          type="button"
++          onClick={() => setExpanded(true)}
++          aria-label={aria}
++          className="relative flex h-11 w-11 items-center justify-center rounded-full border border-white/25 bg-slate-900/90 text-lg shadow-xl backdrop-blur-md transition-transform hover:scale-105 active:scale-95"
++        >
++          <span aria-hidden>{icon}</span>
++          {liveDot && (
++            <span className="absolute -right-0.5 -top-0.5 flex h-2.5 w-2.5">
++              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-green-400 opacity-75" />
++              <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-green-400" />
++            </span>
++          )}
++          {status === 'on' && users.length > 1 && (
++            <span className="absolute -bottom-1 -left-1 min-w-[1rem] rounded-full bg-indigo-500 px-1 text-[9px] font-bold leading-4 text-white">
++              {users.length}
++            </span>
++          )}
++        </button>
++      ) : (
++        <div className="w-56 max-w-[calc(100vw-1rem)] rounded-2xl border border-white/20 bg-slate-900/90 p-3 shadow-xl backdrop-blur-md">
++          {menu}
++        </div>
++      )}
+     </div>
+   );
+ }
+diff --git a/src/gameLogic.ts b/src/gameLogic.ts
+index 456bacd..269cbe8 100644
+--- a/src/gameLogic.ts
++++ b/src/gameLogic.ts
+@@ -21,6 +21,12 @@ export interface GameState {
+   tokens: Token[];
+   diceValues: number[];
+   pendingDice: number[];
++  // Parallel to pendingDice: dice from the same roll share a group id so
++  // choose-one mode can discard only the unused sibling of that roll.
++  pendingDiceGroupIds: number[];
++  // groupId -> true if every remaining die in that group must be played
++  // (the roll contained a 6, or the mode is not choose-one).
++  diceGroupMustUse: Record<number, boolean>;
+   selectedDiceIndex: number | null;
+   diceRolled: boolean;
+   // Winner is set only when the game actually ends (the second-last player finishes)
+@@ -276,32 +282,190 @@ export function moveWouldCapture(tokens: Token[], token: Token, diceValue: numbe
+ //      (e.g. move d1 then d2 — the final square is the same as moving d1+d2),
+ // including the larger accumulated pools produced by bonus re-rolls.
+ 
+-// Enumerate every distinct total a piece can reach by using any non-empty
+-// subset of `pendingDice`. Since applying dice in any order produces the same
+-// final total, subset sums cover all combinations/sequences.
++export function isChooseOneMode(options?: GameOptions): boolean {
++  return !!options && options.diceCount === 2 && options.twoDiceMode === 'choose';
++}
++
++export interface DiceGroupInfo {
++  groupIds: number[];
++  mustUse: Record<number, boolean>;
++}
++
++function emptyDiceGroups(): DiceGroupInfo {
++  return { groupIds: [], mustUse: {} };
++}
++
++// Rebuild (or trust) per-roll groups so choose-one mode can require every 6
++// while still letting the player pick one die from a six-free pair.
+ //
+-// In two-dice "choose" mode the unused die is normally discarded, so only
+-// individual values are reachable — UNLESS the roll contains a 6, in which
+-// case both dice must be used (same as "both" mode). Pass `rollHasSix` so
+-// detection matches that override.
+-export function getReachableTotals(pendingDice: number[], options?: GameOptions, rollHasSix?: boolean): number[] {
+-  if (options && options.diceCount === 2 && options.twoDiceMode === 'choose' && !rollHasSix) {
+-    return [...new Set(pendingDice)];
++// After a double 6 the pool is four dice. Correct choose-one play:
++//   • 2 sixes (double 6 + a six-free pair) → play both 6s and choose one of the other two
++//   • 3 sixes (double 6 + a pair that contains a 6) → play all four
++// 1-die and 2-dice "both" modes always treat every die as mandatory.
++export function inferDiceGroups(
++  pendingDice: number[],
++  options?: GameOptions,
++  rollHasSixFlag?: boolean,
++  existing?: { groupIds?: number[]; mustUse?: Record<number, boolean> },
++): DiceGroupInfo {
++  if (
++    existing?.groupIds &&
++    existing.groupIds.length === pendingDice.length &&
++    existing.mustUse
++  ) {
++    return { groupIds: existing.groupIds.slice(), mustUse: { ...existing.mustUse } };
++  }
++
++  if (pendingDice.length === 0) return emptyDiceGroups();
++
++  const groupIds: number[] = [];
++  const mustUse: Record<number, boolean> = {};
++
++  if (!isChooseOneMode(options)) {
++    mustUse[0] = true;
++    for (let i = 0; i < pendingDice.length; i++) groupIds.push(0);
++    return { groupIds, mustUse };
+   }
+-  const counts = new Map<number, number>();
+-  for (const dv of pendingDice) counts.set(dv, (counts.get(dv) ?? 0) + 1);
+-  const unique = [...counts.keys()];
+-  const totals = new Set<number>();
+-  const rec = (i: number, sum: number) => {
+-    if (i === unique.length) {
+-      if (sum > 0) totals.add(sum);
+-      return;
++
++  if (pendingDice.length === 4) {
++    groupIds.push(0, 0, 1, 1);
++    mustUse[0] = pendingDice[0] === 6 || pendingDice[1] === 6;
++    mustUse[1] = pendingDice[2] === 6 || pendingDice[3] === 6;
++    return { groupIds, mustUse };
++  }
++
++  if (pendingDice.length === 3) {
++    const sixCount = pendingDice.filter(v => v === 6).length;
++    if (sixCount >= 2) {
++      // Leftover from a 3-six / all-mandatory pool.
++      mustUse[0] = true;
++      groupIds.push(0, 0, 0);
++    } else if (sixCount === 1) {
++      // Used one 6 from [6,6,a,b]; remaining 6 is mandatory, the pair is optional.
++      const sixIdx = pendingDice.indexOf(6);
++      for (let i = 0; i < 3; i++) groupIds.push(i === sixIdx ? 0 : 1);
++      mustUse[0] = true;
++      mustUse[1] = false;
++    } else {
++      mustUse[0] = false;
++      groupIds.push(0, 0, 0);
+     }
+-    const value = unique[i];
+-    const max = counts.get(value)!;
+-    for (let k = 0; k <= max; k++) rec(i + 1, sum + value * k);
+-  };
+-  rec(0, 0);
++    return { groupIds, mustUse };
++  }
++
++  if (pendingDice.length === 2) {
++    groupIds.push(0, 0);
++    mustUse[0] = pendingDice[0] === 6 || pendingDice[1] === 6 || !!rollHasSixFlag;
++    return { groupIds, mustUse };
++  }
++
++  groupIds.push(0);
++  mustUse[0] = true;
++  return { groupIds, mustUse };
++}
++
++export function nextDiceGroupId(groupIds: number[]): number {
++  return groupIds.length ? Math.max(...groupIds) + 1 : 0;
++}
++
++// After playing one pending die: drop it, and if it belonged to a choose-one
++// (no-6) pair, also discard its unused sibling. Mandatory groups (any 6, or
++// non-choose modes) keep their remaining dice.
++export function consumePendingDie(
++  pendingDice: number[],
++  groupIds: number[],
++  mustUse: Record<number, boolean>,
++  diceIndex: number,
++  options: GameOptions,
++): { pendingDice: number[]; groupIds: number[] } {
++  const info = inferDiceGroups(pendingDice, options, undefined, { groupIds, mustUse });
++  const nextDice = pendingDice.slice();
++  const nextIds = info.groupIds.slice();
++  const gid = nextIds[diceIndex];
++  nextDice.splice(diceIndex, 1);
++  nextIds.splice(diceIndex, 1);
++
++  if (isChooseOneMode(options) && info.mustUse[gid] === false) {
++    for (let i = nextDice.length - 1; i >= 0; i--) {
++      if (nextIds[i] === gid) {
++        nextDice.splice(i, 1);
++        nextIds.splice(i, 1);
++      }
++    }
++  }
++  return { pendingDice: nextDice, groupIds: nextIds };
++}
++
++export function describePendingDicePlay(
++  pendingDice: number[],
++  options: GameOptions,
++  groupInfo?: DiceGroupInfo,
++): string {
++  if (pendingDice.length <= 1) return ' Tap a token to move.';
++  if (!isChooseOneMode(options)) return ' Select a die, then tap a token.';
++  const info = groupInfo ?? inferDiceGroups(pendingDice, options);
++  const sixCount = pendingDice.filter(v => v === 6).length;
++  const optionalCount = pendingDice.filter((_, i) => info.mustUse[info.groupIds[i]] === false).length;
++  if (optionalCount === 0) return ' Play all dice.';
++  if (sixCount > 0 && optionalCount > 1) {
++    return ` Play every 6 and choose one of the other ${optionalCount} dice.`;
++  }
++  if (optionalCount === pendingDice.length) return ' Choose one die, then tap a token.';
++  return ' Select a die, then tap a token.';
++}
++
++function subsetSumsIncludingZero(values: number[]): number[] {
++  const totals = new Set<number>([0]);
++  for (const v of values) {
++    const current = [...totals];
++    for (const t of current) totals.add(t + v);
++  }
++  return [...totals];
++}
++
++// Enumerate every distinct total a piece can reach with a legal combination
++// of `pendingDice`. Applying dice in any order produces the same final total,
++// so subset sums cover sequences.
++//
++// In two-dice "choose" mode a six-free roll contributes at most one die
++// (the unused sibling is discarded). A roll that contains a 6 must be fully
++// used, same as "both" mode. Extra rolls after a double 6 keep that rule
++// per pair: both 6s are mandatory, and the follow-up pair is either
++// choose-one (no 6) or fully mandatory (has a 6).
++export function getReachableTotals(
++  pendingDice: number[],
++  options?: GameOptions,
++  rollHasSixFlag?: boolean,
++  groupInfo?: DiceGroupInfo,
++): number[] {
++  if (pendingDice.length === 0) return [];
++  const info = inferDiceGroups(pendingDice, options, rollHasSixFlag, groupInfo);
++
++  const byGroup = new Map<number, number[]>();
++  for (let i = 0; i < pendingDice.length; i++) {
++    const gid = info.groupIds[i] ?? 0;
++    const list = byGroup.get(gid);
++    if (list) list.push(pendingDice[i]);
++    else byGroup.set(gid, [pendingDice[i]]);
++  }
++
++  let totals = new Set<number>([0]);
++  for (const [gid, values] of byGroup) {
++    const next = new Set<number>();
++    if (info.mustUse[gid] === false) {
++      for (const t of totals) {
++        next.add(t);
++        for (const v of values) next.add(t + v);
++      }
++    } else {
++      const sums = subsetSumsIncludingZero(values);
++      for (const t of totals) {
++        for (const s of sums) next.add(t + s);
++      }
++    }
++    totals = next;
++  }
++  totals.delete(0);
+   return [...totals].sort((a, b) => a - b);
+ }
+ 
+@@ -314,9 +478,10 @@ export function getCapturableOwnTokens(
+   player: PlayerColor,
+   pendingDice: number[],
+   options?: GameOptions,
+-  rollHasSix?: boolean,
++  rollHasSixFlag?: boolean,
++  groupInfo?: DiceGroupInfo,
+ ): Token[] {
+-  const totals = getReachableTotals(pendingDice, options, rollHasSix);
++  const totals = getReachableTotals(pendingDice, options, rollHasSixFlag, groupInfo);
+   return tokens
+     .filter(t => t.player === player)
+     .filter(t => totals.some(total => moveWouldCapture(tokens, t, total)));
+@@ -483,6 +648,8 @@ export function createInitialState(players: PlayerColor[], options: GameOptions)
+     tokens,
+     diceValues: [],
+     pendingDice: [],
++    pendingDiceGroupIds: [],
++    diceGroupMustUse: {},
+     selectedDiceIndex: null,
+     diceRolled: false,
+     winner: null,
